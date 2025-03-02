@@ -98,6 +98,7 @@ class WebsiteBlocker:
                 "youtube.com",
                 "netflix.com",
                 "tiktok.com",
+                "x.com",
             ]
             
             with open(self.block_list_path, 'w') as f:
