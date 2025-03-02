@@ -35,6 +35,7 @@ class WebsiteBlocker:
         self.marker_end = "# Website Blocker End"
         self.duration_minutes = duration_minutes
         self.start_time = None
+        self.start_monotonic = None
         self.pid_file = "/var/run/website_blocker.pid"
         self.password_hash_file = "/etc/website_blocker/password_hash.txt"
         self.password_clue_file = "/etc/website_blocker/.password_clue.txt"
@@ -393,10 +394,10 @@ class WebsiteBlocker:
             return False
 
     def time_remaining(self):
-        """Calculate remaining blocking time in minutes"""
-        if not self.start_time or not self.duration_minutes:
+        """Calculate remaining blocking time in minutes using monotonic clock"""
+        if not hasattr(self, 'start_monotonic') or not self.duration_minutes:
             return 0
-        elapsed = (datetime.datetime.now() - self.start_time).total_seconds() / 60
+        elapsed = (time.monotonic() - self.start_monotonic) / 60
         remaining = self.duration_minutes - elapsed
         return max(0, remaining)
 
@@ -415,6 +416,7 @@ class WebsiteBlocker:
             return
 
         self.start_time = datetime.datetime.now()
+        self.start_monotonic = time.monotonic()
         end_time = self.start_time + datetime.timedelta(minutes=self.duration_minutes)
         logging.info(f"Starting website blocker for {self.duration_minutes} minutes")
         
