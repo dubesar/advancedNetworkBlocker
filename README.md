@@ -1,6 +1,8 @@
 # advancedNetworkBlocker
 
-Script for blocking websites on macOS (Advanced)
+Script for blocking websites on macOS and Linux with advanced features.
+
+## Overview
 
 Below is an overview of what the script does:
 
@@ -19,25 +21,60 @@ Below is an overview of what the script does:
 
 3. Daemon Operation and Self-Restart
 
-- Daemonization: The script is designed to run as a daemon (background process) using the DaemonContext from the daemon package. It uses a PID file (/var/run/website_blocker.pid) to manage the process.
-- Restart Mechanism: It creates a restart shell script that will restart the blocker if it is forcefully killed during the active blocking period. A corresponding cron job is set up to check and run this restart script every minute.
+- When run with the --daemon flag, the script operates as a background service, continuously monitoring and enforcing the website blocks for the specified duration.
+- A restart script is created that can relaunch the blocker if the process is killed, ensuring that the blocks remain in effect for the full duration.
 
-4. Blocking Duration
+4. Security Features
 
-- The blocker is designed to run for a specified duration (in minutes), passed in as a command-line argument when the script is executed.
-- It continuously monitors the remaining time, updating logs every minute until the time expires.
-- Once the set duration has elapsed, it cleans up by removing the blocking entries, DNS configurations, firewall rules, and stopping the traffic monitor.
+- Password Protection: The script generates a random, complex password during startup. This password is required to disable the blocker before the specified duration expires.
+- Challenge Puzzle: As an additional deterrent, the user must solve a math problem to disable the blocker early, making it harder to impulsively disable the blocks.
 
-5. Early Termination Protection
+## Code Structure
 
-- Math Challenge: If someone tries to terminate the blocker early (by sending signals such as SIGINT or SIGTERM), the script presents a math challenge with three problems. The difficulty increases with each problem.
-- Password Requirement: In addition to solving the math challenge, the user must also locate and decode a complex, auto-generated password. This password is split into four parts and scrambled with extra characters. Clues for the password are stored in a randomly located file (with a hint file helping to locate it).
-- This layered process is designed to discourage impulsive termination of the blocker.
+The code is organized into the following components:
 
-6. Usage and Execution
+```
+src/
+├── core/                  # Core blocker functionality
+│   └── blocker.py         # Main WebsiteBlocker class
+├── file_handlers/         # File management operations
+│   ├── block_list.py      # Block list reading/writing
+│   └── hosts_file.py      # Hosts file manipulation
+├── network/               # Network-related operations
+│   ├── dns_handler.py     # DNS blocking functionality
+│   └── firewall_handler.py # Firewall rule management
+├── security/              # Security features
+│   └── protection.py      # Password protection and file integrity
+└── utils/                 # Utility functions
+    └── daemon.py          # Daemon functionality
+```
 
-- The script is intended to be run as root (it performs operations such as modifying system files, changing firewall rules, etc.).
-- It prints a startup message and waits a few seconds (giving the user a chance to abort) before beginning the blocking operation.
-- Usage typically looks like:
-  `sudo python3 blocker.py <duration_in_minutes>`
-  where the duration determines how long websites are blocked.
+## Usage
+
+1. Install dependencies:
+
+```
+pip install -r requirements.txt
+```
+
+2. Run the script (requires root/sudo access):
+
+```
+sudo python main.py --duration 120  # Block websites for 120 minutes
+sudo python main.py --duration 60 --daemon  # Run in daemon mode for 60 minutes
+```
+
+## Requirements
+
+- Python 3.6+
+- python-daemon>=2.3.0
+- lockfile>=0.12.2
+
+## Platform Support
+
+- macOS: Full support including hosts file modification, pf firewall rules
+- Linux: Full support including hosts file modification, iptables/nftables firewall rules
+
+## License
+
+See the LICENSE file for details.
