@@ -13,7 +13,6 @@ import string
 import socket
 from daemon.daemon import DaemonContext
 import lockfile
-from pathlib import Path
 
 # Configure logging
 logging.basicConfig(
