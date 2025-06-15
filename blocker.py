@@ -11,6 +11,8 @@ import getpass
 import random
 import string
 import socket
+import fcntl
+import errno
 from daemon.daemon import DaemonContext
 import lockfile
 
@@ -36,6 +38,7 @@ class WebsiteBlocker:
         self.start_time = None
         self.start_monotonic = None
         self.pid_file = "/var/run/website_blocker.pid"
+        self.lock_file = "/var/run/website_blocker.lock"
         self.password_hash_file = "/etc/website_blocker/password_hash.txt"
         self.password_clue_file = "/etc/website_blocker/.password_clue.txt"
         self.password_hash = None
@@ -44,6 +47,7 @@ class WebsiteBlocker:
         self.iptables_rules_file = "/etc/website_blocker/iptables_rules.sh"
         self.traffic_monitor_script = "/etc/website_blocker/traffic_monitor.py"
         self.blocked_ips = set()  # Set to store resolved IPs of blocked websites
+        self.state_file = "/etc/website_blocker/blocker_state.json"
         
         # Auto-generate a password
         self.generate_complex_password()
@@ -57,6 +61,264 @@ class WebsiteBlocker:
             except Exception as e:
                 logging.error(f"Failed to create block list directory: {e}")
                 sys.exit(1)
+    
+    def acquire_lock(self):
+        """Acquire an exclusive lock to prevent multiple instances"""
+        try:
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(self.lock_file), exist_ok=True)
+            
+            # Open the lock file
+            self.lock_fd = os.open(self.lock_file, os.O_CREAT | os.O_WRONLY)
+            
+            # Try to acquire an exclusive lock
+            fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            
+            # Write our PID to the file
+            os.write(self.lock_fd, str(os.getpid()).encode())
+            os.fsync(self.lock_fd)
+            
+            logging.info(f"Acquired exclusive lock with PID {os.getpid()}")
+            return True
+            
+        except IOError as e:
+            if e.errno in (errno.EACCES, errno.EAGAIN):
+                # Another instance is running
+                try:
+                    with open(self.lock_file, 'r') as f:
+                        other_pid = f.read().strip()
+                    logging.error(f"Another instance is already running with PID {other_pid}")
+                except:
+                    logging.error("Another instance is already running")
+                return False
+            else:
+                logging.error(f"Failed to acquire lock: {e}")
+                return False
+        except Exception as e:
+            logging.error(f"Unexpected error acquiring lock: {e}")
+            return False
+    
+    def release_lock(self):
+        """Release the exclusive lock"""
+        try:
+            if hasattr(self, 'lock_fd'):
+                fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+                os.close(self.lock_fd)
+                if os.path.exists(self.lock_file):
+                    os.remove(self.lock_file)
+                logging.info("Released exclusive lock")
+        except Exception as e:
+            logging.error(f"Error releasing lock: {e}")
+    
+    def write_pid_file(self):
+        """Write the current PID to the PID file"""
+        try:
+            with open(self.pid_file, 'w') as f:
+                f.write(str(os.getpid()))
+            logging.info(f"Written PID {os.getpid()} to {self.pid_file}")
+        except Exception as e:
+            logging.error(f"Failed to write PID file: {e}")
+    
+    def remove_pid_file(self):
+        """Remove the PID file"""
+        try:
+            if os.path.exists(self.pid_file):
+                os.remove(self.pid_file)
+                logging.info("Removed PID file")
+        except Exception as e:
+            logging.error(f"Failed to remove PID file: {e}")
+    
+    def create_cleanup_script(self):
+        """Create an emergency cleanup script that can be run manually if the blocker crashes"""
+        try:
+            cleanup_script_path = "/etc/website_blocker/emergency_cleanup.sh"
+            cleanup_content = f"""#!/bin/bash
+# Emergency cleanup script for website blocker
+# Run this if the blocker crashes and leaves the system in a blocked state
+
+echo "=== Emergency Website Blocker Cleanup ==="
+
+# Remove the lock file
+if [ -f "{self.lock_file}" ]; then
+    rm -f "{self.lock_file}"
+    echo "Removed lock file"
+fi
+
+# Remove the PID file
+if [ -f "{self.pid_file}" ]; then
+    rm -f "{self.pid_file}"
+    echo "Removed PID file"
+fi
+
+# Kill any remaining blocker processes
+pkill -f "blocker.py" 2>/dev/null
+pkill -f "website_blocker" 2>/dev/null
+
+# Restore hosts file from backup
+if [ -f "{self.hosts_backup}" ]; then
+    cp "{self.hosts_backup}" "{self.hosts_path}"
+    echo "Restored hosts file from backup"
+else
+    # If no backup, remove blocker entries manually
+    sed -i '/{self.marker_start}/,/{self.marker_end}/d' "{self.hosts_path}" 2>/dev/null || \
+    sed -i '' '/{self.marker_start}/,/{self.marker_end}/d' "{self.hosts_path}" 2>/dev/null
+    echo "Cleaned hosts file"
+fi
+
+# Make hosts file writable again
+chmod 644 "{self.hosts_path}"
+
+# Remove DNS blocking if configured
+if [ -f "{self.dnsmasq_conf_path}" ]; then
+    rm -f "{self.dnsmasq_conf_path}"
+    echo "Removed DNS blocking configuration"
+    
+    # Restart dnsmasq if available
+    if command -v systemctl &> /dev/null; then
+        systemctl restart dnsmasq 2>/dev/null
+    fi
+fi
+
+# Remove firewall rules
+if [ -f "{self.iptables_rules_file}" ]; then
+    # Restore iptables rules
+    iptables-restore < /etc/iptables/rules.v4.backup 2>/dev/null
+    rm -f "{self.iptables_rules_file}"
+    echo "Removed firewall rules"
+fi
+
+# Stop traffic monitor
+pkill -f "{self.traffic_monitor_script}" 2>/dev/null
+if [ -f "{self.traffic_monitor_script}" ]; then
+    rm -f "{self.traffic_monitor_script}"
+    echo "Stopped traffic monitor"
+fi
+
+# Flush DNS cache
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    dscacheutil -flushcache 2>/dev/null
+    killall -HUP mDNSResponder 2>/dev/null
+else
+    systemctl restart systemd-resolved 2>/dev/null || \
+    service nscd restart 2>/dev/null || \
+    service dnsmasq restart 2>/dev/null
+fi
+
+echo "=== Cleanup complete ==="
+echo "Your system should now be restored to normal operation."
+echo "If you still have issues, try rebooting your system."
+"""
+            
+            os.makedirs(os.path.dirname(cleanup_script_path), exist_ok=True)
+            with open(cleanup_script_path, 'w') as f:
+                f.write(cleanup_content)
+            os.chmod(cleanup_script_path, 0o755)
+            
+            logging.info(f"Created emergency cleanup script at {cleanup_script_path}")
+            
+        except Exception as e:
+            logging.error(f"Failed to create cleanup script: {e}")
+    
+    def start_watchdog(self):
+        """Start a watchdog process that monitors the main blocker and cleans up if it crashes"""
+        try:
+            parent_pid = os.getpid()
+            
+            # Fork a child process for the watchdog
+            pid = os.fork()
+            
+            if pid == 0:  # Child process (watchdog)
+                # Detach from parent process group
+                os.setsid()
+                
+                # Ignore signals that might affect the parent
+                signal.signal(signal.SIGINT, signal.SIG_IGN)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                
+                logging.info(f"Watchdog started for parent PID {parent_pid}")
+                
+                while True:
+                    time.sleep(5)  # Check every 5 seconds
+                    
+                    # Check if parent process is still alive
+                    try:
+                        os.kill(parent_pid, 0)  # Signal 0 just checks if process exists
+                    except OSError:
+                        # Parent process is dead, perform cleanup
+                        logging.critical(f"Parent process {parent_pid} has died! Performing emergency cleanup...")
+                        
+                        # Run the emergency cleanup script
+                        cleanup_script = "/etc/website_blocker/emergency_cleanup.sh"
+                        if os.path.exists(cleanup_script):
+                            subprocess.run([cleanup_script], capture_output=True)
+                        
+                        # Exit the watchdog
+                        os._exit(0)
+                    
+                    # Also check if the blocking period has ended
+                    if hasattr(self, 'start_time') and self.duration_minutes:
+                        elapsed = (datetime.datetime.now() - self.start_time).total_seconds() / 60
+                        if elapsed >= self.duration_minutes:
+                            logging.info("Blocking period ended, watchdog exiting")
+                            os._exit(0)
+            
+            else:  # Parent process
+                self.watchdog_pid = pid
+                logging.info(f"Started watchdog process with PID {pid}")
+                
+        except Exception as e:
+            logging.error(f"Failed to start watchdog: {e}")
+    
+    def stop_watchdog(self):
+        """Stop the watchdog process"""
+        try:
+            if hasattr(self, 'watchdog_pid'):
+                os.kill(self.watchdog_pid, signal.SIGTERM)
+                logging.info("Stopped watchdog process")
+        except:
+            pass
+    
+    def save_state(self, websites):
+        """Save the current state to a file for recovery"""
+        try:
+            state = {
+                'start_time': self.start_time.isoformat() if self.start_time else None,
+                'duration_minutes': self.duration_minutes,
+                'websites': list(websites),
+                'pid': os.getpid(),
+                'hosts_hash': self.hosts_file_hash
+            }
+            
+            with open(self.state_file, 'w') as f:
+                import json
+                json.dump(state, f)
+                
+        except Exception as e:
+            logging.error(f"Failed to save state: {e}")
+    
+    def restore_state(self):
+        """Restore state from file if it exists"""
+        try:
+            if not os.path.exists(self.state_file):
+                return None
+                
+            with open(self.state_file, 'r') as f:
+                import json
+                state = json.load(f)
+                
+            # Check if the saved process is still running
+            try:
+                os.kill(state['pid'], 0)
+                # Process is still running
+                return None
+            except OSError:
+                # Process is not running, we can restore
+                logging.info("Found orphaned state file, restoring...")
+                return state
+                
+        except Exception as e:
+            logging.error(f"Failed to restore state: {e}")
+            return None
         
     def backup_hosts(self):
         """Create a backup of the hosts file if it doesn't exist"""
@@ -407,32 +669,53 @@ class WebsiteBlocker:
             logging.error("Duration not specified")
             return
 
-        self.backup_hosts()
-        websites = self.read_block_list()
+        # Acquire exclusive lock to prevent multiple instances
+        if not self.acquire_lock():
+            logging.error("Failed to acquire lock - another instance may be running")
+            sys.exit(1)
         
-        if not websites:
-            logging.error("No websites to block")
-            return
+        try:
+            # Write PID file after acquiring lock
+            self.write_pid_file()
 
-        self.start_time = datetime.datetime.now()
-        self.start_monotonic = time.monotonic()
-        end_time = self.start_time + datetime.timedelta(minutes=self.duration_minutes)
-        logging.info(f"Starting website blocker for {self.duration_minutes} minutes")
-        
-        # Create a restart script that will be triggered if the process is killed forcefully
-        self.create_restart_script(end_time)
+            self.backup_hosts()
+            websites = self.read_block_list()
+            
+            if not websites:
+                logging.error("No websites to block")
+                return
 
-        # Enable blocking
-        if self.update_hosts(websites, blocking=True):
-            self.protect_files(protect=True)
+            self.start_time = datetime.datetime.now()
+            self.start_monotonic = time.monotonic()
+            end_time = self.start_time + datetime.timedelta(minutes=self.duration_minutes)
+            logging.info(f"Starting website blocker for {self.duration_minutes} minutes")
+            
+            # Create a restart script that will be triggered if the process is killed forcefully
+            self.create_restart_script(end_time)
+
+            # Enable blocking
+            if self.update_hosts(websites, blocking=True):
+                self.protect_files(protect=True)
             
             # Calculate the expected hash of the hosts file for integrity checking
             self.hosts_file_hash = self.calculate_file_hash(self.hosts_path)
             logging.info("Calculated initial hosts file hash for integrity monitoring")
             
-            # Set up signal handlers
+            # Set up comprehensive signal handlers
             signal.signal(signal.SIGTERM, self._signal_handler)
             signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGHUP, self._signal_handler)
+            signal.signal(signal.SIGQUIT, self._signal_handler)
+            
+            # Set up signal handler for unexpected termination
+            signal.signal(signal.SIGABRT, self._emergency_cleanup_handler)
+            signal.signal(signal.SIGSEGV, self._emergency_cleanup_handler)
+            
+            # Create emergency cleanup script
+            self.create_cleanup_script()
+            
+            # Create watchdog process
+            self.start_watchdog()
             
             logging.info("Website blocker is now running in active mode")
             
@@ -444,10 +727,18 @@ class WebsiteBlocker:
                 # Check hosts file integrity
                 self.check_hosts_file_integrity(websites)
                 
+                # Save state periodically
+                self.save_state(websites)
+                
                 time.sleep(60)  # Check every minute
 
             # Cleanup when time is up
             self.cleanup()
+        
+        finally:
+            # Always release the lock and remove PID file
+            self.release_lock()
+            self.remove_pid_file()
             
     def calculate_file_hash(self, file_path):
         """Calculate SHA-256 hash of a file"""
@@ -509,6 +800,18 @@ class WebsiteBlocker:
         except Exception as e:
             logging.error(f"Failed to restore hosts file: {e}")
 
+    def _emergency_cleanup_handler(self, signum, frame):
+        """Emergency cleanup handler for unexpected termination"""
+        logging.critical(f"Emergency cleanup triggered by signal {signum}")
+        try:
+            self.cleanup()
+        except:
+            pass
+        finally:
+            self.release_lock()
+            self.remove_pid_file()
+            os._exit(1)
+    
     def _signal_handler(self, signum, frame):
         """Handle termination signals"""
         remaining = self.time_remaining()
@@ -628,6 +931,10 @@ fi
     def cleanup(self):
         """Remove blocks and file protection"""
         logging.info("Cleaning up...")
+        
+        # Stop the watchdog process first
+        self.stop_watchdog()
+        
         self.protect_files(protect=False)
         self.update_hosts([], blocking=False)
         
@@ -679,6 +986,14 @@ fi
                 logging.info("Removed restart script")
             except Exception as e:
                 logging.error(f"Failed to remove restart script: {e}")
+        
+        # Remove state file
+        if os.path.exists(self.state_file):
+            try:
+                os.remove(self.state_file)
+                logging.info("Removed state file")
+            except Exception as e:
+                logging.error(f"Failed to remove state file: {e}")
                 
         logging.info("Website blocker stopped")
 
@@ -1019,6 +1334,27 @@ if __name__ == "__main__":
     print("This process is designed to be difficult to discourage impulsive termination.")
     print("If you're trying to focus, this is a feature, not a bug!")
     print("\nStarting in 5 seconds... Press Ctrl+C now to abort.")
+    print("\nNOTE: If the blocker crashes, run the following command to clean up:")
+    print("  sudo /etc/website_blocker/emergency_cleanup.sh")
+    
+    # Check if another instance is already running
+    lock_file = "/var/run/website_blocker.lock"
+    try:
+        # Try to open and lock the file
+        test_fd = os.open(lock_file, os.O_CREAT | os.O_WRONLY | os.O_NONBLOCK)
+        fcntl.flock(test_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # If we got here, no other instance is running
+        fcntl.flock(test_fd, fcntl.LOCK_UN)
+        os.close(test_fd)
+    except IOError as e:
+        if e.errno in (errno.EACCES, errno.EAGAIN):
+            print("\nERROR: Another instance of the website blocker is already running!")
+            print("If you believe this is an error, you can remove the lock file:")
+            print(f"  sudo rm {lock_file}")
+            sys.exit(1)
+    except Exception as e:
+        print(f"\nERROR: Failed to check for existing instances: {e}")
+        sys.exit(1)
     
     try:
         time.sleep(5)
