@@ -254,13 +254,6 @@ echo "If you still have issues, try rebooting your system."
                         
                         # Exit the watchdog
                         os._exit(0)
-                    
-                    # Also check if the blocking period has ended
-                    if hasattr(self, 'start_time') and self.duration_minutes:
-                        elapsed = (datetime.datetime.now() - self.start_time).total_seconds() / 60
-                        if elapsed >= self.duration_minutes:
-                            logging.info("Blocking period ended, watchdog exiting")
-                            os._exit(0)
             
             else:  # Parent process
                 self.watchdog_pid = pid
