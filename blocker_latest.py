@@ -435,6 +435,8 @@ def do_block(opts: BlockOptions) -> None:
     ensure_root()
     if not opts.domains:
         sys.exit("No domains provided to block. Use --domains or --file")
+    if not opts.duration_seconds or opts.duration_seconds <= 0:
+        sys.exit("--duration is required and must be > 0. Example: -t 45m")
 
     # Prevent overlapping blocks if a daemon is already running
     existing_pid = read_pid_file()
@@ -475,15 +477,8 @@ def do_block(opts: BlockOptions) -> None:
     # Ensure quick effect
     flush_dns_cache()
 
-    if not opts.duration_seconds or opts.duration_seconds <= 0:
-        sys.exit("--duration is required and must be > 0. Example: -t 45m")
-
     daemonize_and_schedule_unblock(opts.duration_seconds)
     print(f"Blocking {len(normalized_domains)} domains for {opts.duration_seconds} seconds (detached)")
-
-
- 
-
 
 def daemonize_and_schedule_unblock(after_seconds: int) -> None:
     # Double-fork daemonization
@@ -616,6 +611,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     if args.command == "block":
+        # Check if a block is already in progress
+        state = read_state()
+        remaining = compute_remaining_seconds_from_state(state) if state else None
+        if remaining is not None and remaining > 0:
+            sys.exit(f"Timer not finished: {humanize_seconds(remaining)} remaining. Try again later")
+
+        # Parse domains and duration
         domains: List[str] = list(args.domains or [])
         if args.file:
             domains.extend(read_domains_from_file(args.file))
@@ -641,7 +643,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         state = read_state()
         remaining = compute_remaining_seconds_from_state(state) if state else None
         if remaining is not None and remaining > 0:
-            sys.exit(f"Timer not finished: {humanize_seconds(remaining)} remaining. Try again later or use --force to override.")
+            sys.exit(f"Timer not finished: {humanize_seconds(remaining)} remaining. Try again later")
         do_unblock()
         return
 
