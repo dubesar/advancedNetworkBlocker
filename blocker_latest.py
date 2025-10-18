@@ -407,14 +407,37 @@ def compute_remaining_seconds_from_state(state: dict) -> Optional[int]:
             return None
         start_dt = dt.datetime.fromisoformat(start_iso)
         now_dt = dt.datetime.now().astimezone()
-        # If start_dt has no tzinfo, assume local timezone
+        # If start_dt has no tzinfo, assume local timezone rather than raising
         if start_dt.tzinfo is None:
-            start_dt = start_dt.astimezone()
+            start_dt = start_dt.replace(tzinfo=now_dt.tzinfo)
         end_dt = start_dt + dt.timedelta(seconds=duration)
         remaining = (end_dt - now_dt).total_seconds()
         return max(0, int(remaining))
     except Exception:
         return None
+
+
+def resume_daemon_if_needed(state: Optional[dict] = None) -> Optional[int]:
+    state = state or read_state()
+    if not state:
+        return None
+
+    remaining = compute_remaining_seconds_from_state(state)
+    pid = read_pid_file()
+
+    if remaining is None or remaining <= 0:
+        if pid and not pid_is_running(pid):
+            remove_pid_file()
+        return None
+
+    if pid and pid_is_running(pid):
+        return remaining
+
+    try:
+        daemonize_and_schedule_unblock(remaining, detach_parent=False)
+    except Exception:
+        pass
+    return remaining
 
 
 # ---------- Core operations ----------
@@ -447,9 +470,16 @@ def do_block(opts: BlockOptions) -> None:
     elif existing_pid and not pid_is_running(existing_pid):
         remove_pid_file()
 
+    # Ensure we resume any pending block before starting a new one
+    state = read_state()
+    resumed = resume_daemon_if_needed(state)
+    if resumed and resumed > 0:
+        sys.exit(f"Timer not finished: {humanize_seconds(resumed)} remaining. Existing block resumed.")
+
+    state = {}
     normalized_domains = expand_www_variants(opts.domains)
 
-    state: dict = {
+    state = {
         "start_time": now_iso(),
         "domains": normalized_domains,
         "use_hosts": opts.use_hosts,
@@ -476,16 +506,18 @@ def do_block(opts: BlockOptions) -> None:
     write_state(state)
     # Ensure quick effect
     flush_dns_cache()
-
-    daemonize_and_schedule_unblock(opts.duration_seconds)
+    
     print(f"Blocking {len(normalized_domains)} domains for {opts.duration_seconds} seconds (detached)")
+    daemonize_and_schedule_unblock(opts.duration_seconds)
 
-def daemonize_and_schedule_unblock(after_seconds: int) -> None:
+def daemonize_and_schedule_unblock(after_seconds: int, detach_parent: bool = True) -> None:
     # Double-fork daemonization
     pid = os.fork()
     if pid > 0:
-        # Parent exits
-        os._exit(0)
+        if detach_parent:
+            os._exit(0)
+        os.waitpid(pid, 0)
+        return
     os.setsid()
     pid = os.fork()
     if pid > 0:
@@ -497,9 +529,11 @@ def daemonize_and_schedule_unblock(after_seconds: int) -> None:
         os.dup2(devnull_out.fileno(), sys.stdout.fileno())
         os.dup2(devnull_out.fileno(), sys.stderr.fileno())
 
-    # Ignore termination signals to make it harder to kill (not foolproof)
+    # Ignore termination and child reaper to avoid zombies (best-effort hard-to-kill)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    with contextlib.suppress(Exception):
+        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
 
     # Record daemon PID
     try:
@@ -507,16 +541,36 @@ def daemonize_and_schedule_unblock(after_seconds: int) -> None:
     except Exception:
         pass
 
-    time.sleep(after_seconds)
-    # Run unblock in this process
+    # Keep system awake if possible so wall-clock timing isn't extended by sleep
+    caffeinate_proc = None
     try:
-        do_unblock()
+        caffeinate_proc = subprocess.Popen([
+            "/usr/bin/caffeinate", "-dimsu", "-w", str(os.getpid())
+        ])
     except Exception:
-        # Best-effort; nothing else to do in daemon context
-        pass
+        caffeinate_proc = None
+
+    # Wall-clock based wait loop resilient to system sleep/hibernation
+    try:
+        # If state disappears or time elapses, proceed to unblock
+        while True:
+            state = read_state()
+            remaining = compute_remaining_seconds_from_state(state)
+            if remaining is None or remaining <= 0:
+                break
+            time.sleep(min(remaining, 30))
+
+        try:
+            do_unblock()
+        except Exception:
+            pass
     finally:
         with contextlib.suppress(Exception):
             remove_pid_file()
+        # caffeinate -w exits automatically when watched pid ends; ensure it's not left around
+        with contextlib.suppress(Exception):
+            if caffeinate_proc and caffeinate_proc.poll() is None:
+                caffeinate_proc.terminate()
         os._exit(0)
 
 
@@ -526,6 +580,7 @@ def do_unblock() -> None:
     ensure_root()
 
     state = read_state()
+    resume_daemon_if_needed(state)
     use_hosts = bool(state.get("use_hosts", True))
     use_pf = bool(state.get("use_pf", True))
     restore_immutable: Optional[bool] = None
@@ -546,6 +601,8 @@ def do_unblock() -> None:
 
 
 def do_status() -> None:
+    state = read_state()
+    resume_daemon_if_needed(state)
     hosts_content = read_hosts()
     has_block = HOSTS_START_MARK in hosts_content and HOSTS_END_MARK in hosts_content
     hosts_flag = is_hosts_immutable()
@@ -554,7 +611,6 @@ def do_status() -> None:
     has_pf_rules = bool(pf_rules.stdout.strip()) and not pf_rules.stdout.strip().startswith("No ALTQ support")
     pid = read_pid_file()
     pid_running = bool(pid and pid_is_running(pid))
-    state = read_state()
     remaining = compute_remaining_seconds_from_state(state) if state else None
 
     print("Status:")
@@ -613,10 +669,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.command == "block":
         # Check if a block is already in progress
         state = read_state()
-        remaining = compute_remaining_seconds_from_state(state) if state else None
+        remaining = resume_daemon_if_needed(state)
         if remaining is not None and remaining > 0:
             sys.exit(f"Timer not finished: {humanize_seconds(remaining)} remaining. Try again later")
-
         # Parse domains and duration
         domains: List[str] = list(args.domains or [])
         if args.file:
@@ -641,7 +696,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.command == "unblock":
         # By default, only allow when timer has completed
         state = read_state()
-        remaining = compute_remaining_seconds_from_state(state) if state else None
+        remaining = resume_daemon_if_needed(state)
         if remaining is not None and remaining > 0:
             sys.exit(f"Timer not finished: {humanize_seconds(remaining)} remaining. Try again later")
         do_unblock()
