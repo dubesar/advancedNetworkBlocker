@@ -66,10 +66,14 @@ def now_iso() -> str:
 
 
 def normalize_domain(domain: str) -> str:
+    """Normalize a domain string to a bare hostname.
+    - strips scheme (http/https), path/query
+    - lowercases
+    - removes a trailing dot
+    """
     d = domain.strip().lower()
     d = re.sub(r"^https?://", "", d)
     d = d.split("/")[0]
-    # Remove trailing dot
     if d.endswith('.'):
         d = d[:-1]
     return d
@@ -82,13 +86,15 @@ def is_subdomain(domain: str) -> bool:
 
 
 def expand_www_variants(domains: Iterable[str]) -> List[str]:
+    """Return unique domains plus a www.<domain> variant only for base domains.
+    Subdomains like blog.example.com are left as-is; we add www.* only for example.com.
+    """
     expanded: Set[str] = set()
     for d in domains:
         nd = normalize_domain(d)
         if not nd:
             continue
         expanded.add(nd)
-        # Add www variant for base domains only (avoid subdomains like blog.example.com)
         if "." in nd and not nd.startswith("www.") and not is_subdomain(nd):
             expanded.add(f"www.{nd}")
     return sorted(expanded)
@@ -167,13 +173,15 @@ def remove_pid_file() -> None:
 
 
 def pid_is_running(pid: int) -> bool:
+    """Best-effort process liveness check using kill(pid, 0).
+    Returns True on PermissionError to avoid false negatives when not root (our flows are root-only).
+    """
     try:
         os.kill(pid, 0)
         return True
     except ProcessLookupError:
         return False
     except PermissionError:
-        # Unlikely as root; assume running
         return True
 
 
@@ -299,7 +307,10 @@ def pf_conf_contains_anchor() -> bool:
 
 
 def pf_ensure_anchor_in_pfconf() -> bool:
-    """Ensure pf.conf contains the anchor include. Returns True if we modified it."""
+    """Ensure pf.conf contains our anchor include.
+    NOTE: This appends lines permanently to /etc/pf.conf and does not remove them on unblock.
+    Returns True if we modified pf.conf.
+    """
     try:
         with open(PF_CONF_FILE, "r", encoding="utf-8") as f:
             content = f.read()
@@ -351,6 +362,9 @@ def pf_load_rules() -> None:
 
 
 def pf_clear_anchor_rules() -> None:
+    """Clear rules within our anchor and reload PF.
+    Does not remove the anchor include from /etc/pf.conf; we keep the include for subsequent runs.
+    """
     # Overwrite anchor file with a harmless comment
     os.makedirs(os.path.dirname(PF_ANCHOR_FILE), exist_ok=True)
     with open(PF_ANCHOR_FILE, "w", encoding="utf-8") as f:
@@ -417,7 +431,7 @@ def compute_remaining_seconds_from_state(state: dict) -> Optional[int]:
         return None
 
 
-def resume_daemon_if_needed(state: Optional[dict] = None) -> Optional[int]:
+def resume_daemon_if_needed(state: Optional[dict] = None, clean_on_expiry: bool = False) -> Optional[int]:
     state = state or read_state()
     if not state:
         return None
@@ -428,6 +442,9 @@ def resume_daemon_if_needed(state: Optional[dict] = None) -> Optional[int]:
     if remaining is None or remaining <= 0:
         if pid and not pid_is_running(pid):
             remove_pid_file()
+        if clean_on_expiry:
+            with contextlib.suppress(Exception):
+                do_unblock()
         return None
 
     if pid and pid_is_running(pid):
@@ -470,9 +487,9 @@ def do_block(opts: BlockOptions) -> None:
     elif existing_pid and not pid_is_running(existing_pid):
         remove_pid_file()
 
-    # Ensure we resume any pending block before starting a new one
+    # Ensure we resume/cleanup any pending block before starting a new one
     state = read_state()
-    resumed = resume_daemon_if_needed(state)
+    resumed = resume_daemon_if_needed(state, clean_on_expiry=True)
     if resumed and resumed > 0:
         sys.exit(f"Timer not finished: {humanize_seconds(resumed)} remaining. Existing block resumed.")
 
@@ -601,8 +618,10 @@ def do_unblock() -> None:
 
 
 def do_status() -> None:
+    # Clean up if prior state vanished but blocks remain (root only)
+    cleanup_dangling_blocks_if_no_state()
     state = read_state()
-    resume_daemon_if_needed(state)
+    resume_daemon_if_needed(state, clean_on_expiry=(os.geteuid() == 0))
     hosts_content = read_hosts()
     has_block = HOSTS_START_MARK in hosts_content and HOSTS_END_MARK in hosts_content
     hosts_flag = is_hosts_immutable()
@@ -621,6 +640,48 @@ def do_status() -> None:
     print(f"- daemon pid: {pid if pid else 'none'} (running: {pid_running})")
     if remaining is not None:
         print(f"- remaining: {humanize_seconds(remaining)}")
+
+
+# ---------- Consistency repair for edge cases ----------
+
+def cleanup_dangling_blocks_if_no_state() -> bool:
+    """If state is missing but hosts/PF blocks remain, clean them up safely.
+    Returns True if any cleanup was performed.
+    """
+    try:
+        if os.geteuid() != 0:
+            return False
+    except Exception:
+        return False
+
+    state = read_state()
+    if state:
+        return False
+
+    changed = False
+    try:
+        hosts_content = read_hosts()
+        has_block = HOSTS_START_MARK in hosts_content and HOSTS_END_MARK in hosts_content
+        if has_block:
+            # Preserve current immutability behavior inside remove_hosts_block
+            remove_hosts_block(restore_immutable=None)
+            changed = True
+    except Exception:
+        pass
+
+    try:
+        pf_rules = run_cmd(["/sbin/pfctl", "-a", PF_ANCHOR_NAME, "-s", "rules"], check=False)
+        has_pf_rules = bool(pf_rules.stdout.strip()) and not pf_rules.stdout.strip().startswith("No ALTQ support")
+        if has_pf_rules:
+            pf_clear_anchor_rules()
+            changed = True
+    except Exception:
+        pass
+
+    if changed:
+        with contextlib.suppress(Exception):
+            flush_dns_cache()
+    return changed
 
 
 # ---------- CLI parsing ----------
@@ -667,9 +728,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     if args.command == "block":
+        # Repair dangling blocks if state is missing (root only)
+        cleanup_dangling_blocks_if_no_state()
         # Check if a block is already in progress
         state = read_state()
-        remaining = resume_daemon_if_needed(state)
+        remaining = resume_daemon_if_needed(state, clean_on_expiry=True)
         if remaining is not None and remaining > 0:
             sys.exit(f"Timer not finished: {humanize_seconds(remaining)} remaining. Try again later")
         # Parse domains and duration
