@@ -322,6 +322,11 @@ def pf_enable() -> None:
         run_cmd(["/sbin/pfctl", "-E"])  # Enable packet filter
 
 
+def pf_disable() -> None:
+    if pf_is_enabled():
+        run_cmd(["/sbin/pfctl", "-d"])  # Disable packet filter
+
+
 def pf_anchor_lines() -> str:
     return (
         f"\n# website_blocker anchor (added {now_iso()})\n"
@@ -583,6 +588,7 @@ def do_block(opts: BlockOptions) -> None:
         state.update(hosts_info)
 
     if opts.use_pf:
+        pf_was_enabled_before = pf_is_enabled()
         v4, v6 = resolve_domain_ips(normalized_domains)
         pf_enable()
         # Ensure PF is actually enabled before proceeding
@@ -597,6 +603,7 @@ def do_block(opts: BlockOptions) -> None:
             "pf_modified_pfconf": modified_pfconf,
             "pf_ipv4": v4,
             "pf_ipv6": v6,
+            "pf_was_enabled_before": pf_was_enabled_before,
         })
 
     write_state(state)
@@ -688,6 +695,11 @@ def do_unblock() -> None:
 
     if use_pf:
         pf_clear_anchor_rules()
+        # Restore PF enabled state only if we had enabled it
+        pf_prev = state.get("pf_was_enabled_before")
+        if pf_prev is False:
+            with contextlib.suppress(Exception):
+                pf_disable()
 
     # Flush DNS caches so changes take effect immediately
     flush_dns_cache()
