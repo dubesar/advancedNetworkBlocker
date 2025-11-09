@@ -24,7 +24,6 @@ import subprocess
 import sys
 import time
 from typing import Iterable, List, Optional, Sequence, Set, Tuple
-from urllib.parse import urlsplit
 
 
 # ---------- Constants ----------
@@ -51,7 +50,7 @@ def is_macos() -> bool:
 
 def ensure_root() -> None:
     if os.geteuid() != 0:
-        sys.exit("This command must be run as root. Try: sudo python3 website_blocker.py ...")
+        sys.exit("This command must be run as root. Try: sudo python3 blocker_latest.py ...")
 
 
 def run_cmd(cmd: Sequence[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -283,7 +282,7 @@ def remove_marked_block(text: str) -> Tuple[str, bool]:
 def make_hosts_block(domains: Sequence[str]) -> str:
     lines = [
         HOSTS_START_MARK,
-        f"# Added at {now_iso()} by website_blocker.py",
+        f"# Added at {now_iso()} by blocker_latest.py",
     ]
     for dom in domains:
         # Skip IP literals in hosts; PF handles IP-level blocking
@@ -367,16 +366,6 @@ def pf_anchor_lines() -> str:
         f"anchor \"{PF_ANCHOR_NAME}\"\n"
         f"load anchor \"{PF_ANCHOR_NAME}\" from \"{PF_ANCHOR_FILE}\"\n"
     )
-
-
-def pf_conf_contains_anchor() -> bool:
-    try:
-        with open(PF_CONF_FILE, "r", encoding="utf-8") as f:
-            content = f.read()
-        return PF_ANCHOR_NAME in content and PF_ANCHOR_FILE in content
-    except FileNotFoundError:
-        return False
-
 
 def pf_ensure_anchor_in_pfconf() -> bool:
     """Ensure pf.conf contains our anchor include.
@@ -735,7 +724,8 @@ def do_unblock() -> None:
     ensure_root()
 
     state = read_state()
-    resume_daemon_if_needed(state)
+    # Do not attempt to (re)spawn any scheduler here. The unblock path
+    # should be side-effect free aside from performing cleanup.
     use_hosts = bool(state.get("use_hosts", True))
     use_pf = bool(state.get("use_pf", True))
     restore_immutable: Optional[bool] = None
@@ -785,7 +775,7 @@ def do_status() -> None:
     print(f"- hosts immutable: {hosts_flag}")
     print(f"- pf enabled: {pf_enabled_opt if pf_enabled_opt is not None else 'unknown (run as root)'}")
     print(f"- pf anchor rules present: {has_pf_rules_opt if has_pf_rules_opt is not None else 'unknown (run as root)'}")
-    print(f"- daemon pid: {pid if pid else 'none'} (running: {pid_running})")
+    # print(f"- daemon pid: {pid if pid else 'none'} (running: {pid_running})")
     if remaining is not None:
         print(f"- remaining: {humanize_seconds(remaining)}")
 
@@ -906,7 +896,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             domains.extend(read_domains_from_file(args.file))
         if not domains:
             parser.error("No domains provided. Use --domains or --file")
-        duration_seconds = parse_duration_to_seconds(args.duration) if args.duration else None
+        try:
+            duration_seconds = parse_duration_to_seconds(args.duration) if args.duration else None
+        except ValueError as e:
+            parser.error(str(e))
         opts = BlockOptions(
             domains=domains,
             use_hosts=bool(args.use_hosts),
@@ -924,7 +917,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.command == "unblock":
         # By default, only allow when timer has completed
         state = read_state()
-        remaining = resume_daemon_if_needed(state)
+        # Do not spawn a daemon while checking remaining time for unblock
+        remaining = resume_daemon_if_needed(state, allow_daemonize=False)
         if remaining is not None and remaining > 0:
             sys.exit(f"Timer not finished: {humanize_seconds(remaining)} remaining. Try again later")
         do_unblock()
