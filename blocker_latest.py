@@ -185,6 +185,23 @@ def pid_is_running(pid: int) -> bool:
         return True
 
 
+def pid_looks_like_blocker(pid: int) -> bool:
+    """Heuristic to verify that the given PID likely belongs to this blocker.
+    Avoids false positives when a stale pidfile points to a reused PID for an unrelated process.
+    """
+    try:
+        out = run_cmd(["/bin/ps", "-o", "command=", "-p", str(pid)], check=False).stdout.strip()
+        # Match common invocations; keep broad but specific to this tool's script/anchor names.
+        return (
+            "blocker_latest.py" in out
+            or "blocker_latest" in out
+            or "website_blocker" in out
+            or PF_ANCHOR_NAME in out
+            or PF_ANCHOR_NAME.lower() in out
+        )
+    except Exception:
+        return False
+
 # ---------- /etc/hosts management ----------
 
 def is_hosts_immutable() -> bool:
@@ -280,8 +297,24 @@ def remove_hosts_block(restore_immutable: Optional[bool]) -> None:
 
 def pf_is_enabled() -> bool:
     res = run_cmd(["/sbin/pfctl", "-s", "info"], check=False)
-    # Look for "Status: Enabled"
-    return "Status: Enabled" in res.stdout
+    # pfctl often prints status lines to stderr; check combined output.
+    out = (res.stdout or "") + (res.stderr or "")
+    return "Status: Enabled" in out
+
+
+def pf_enabled_status_unprivileged() -> Optional[bool]:
+    """Best-effort PF enabled check that can be called without root.
+    Returns True/False if determinable, otherwise None when permissions prevent a reliable check.
+    """
+    res = run_cmd(["/sbin/pfctl", "-s", "info"], check=False)
+    out = ((res.stdout or "") + (res.stderr or "")).strip()
+    if "Status: Enabled" in out:
+        return True
+    if "Status: Disabled" in out or "pf not enabled" in out.lower():
+        return False
+    if "Permission denied" in out or "Operation not permitted" in out:
+        return None
+    return None
 
 
 def pf_enable() -> None:
@@ -359,6 +392,21 @@ def pf_load_rules() -> None:
     # Load/refresh the main pf.conf (which includes our anchor) and specifically refresh the anchor as well
     run_cmd(["/sbin/pfctl", "-f", PF_CONF_FILE])
     run_cmd(["/sbin/pfctl", "-a", PF_ANCHOR_NAME, "-f", PF_ANCHOR_FILE])
+
+
+def pf_anchor_rules_present_unprivileged() -> Optional[bool]:
+    """Best-effort check for anchor rules presence without requiring root.
+    Returns True/False if determinable, None if permission denied prevents checking.
+    """
+    pf_rules = run_cmd(["/sbin/pfctl", "-a", PF_ANCHOR_NAME, "-s", "rules"], check=False)
+    text = ((pf_rules.stdout or "") + (pf_rules.stderr or "")).strip()
+    if "Permission denied" in text or "Operation not permitted" in text:
+        return None
+    if pf_rules.returncode == 0 and text and not text.startswith("No ALTQ support"):
+        return True
+    if pf_rules.returncode == 0:
+        return False
+    return None
 
 
 def pf_clear_anchor_rules() -> None:
@@ -481,9 +529,35 @@ def do_block(opts: BlockOptions) -> None:
     # Prevent overlapping blocks if a daemon is already running
     existing_pid = read_pid_file()
     if existing_pid and pid_is_running(existing_pid):
-        existing_state = read_state()
-        rem = compute_remaining_seconds_from_state(existing_state) or 0
-        sys.exit(f"A block daemon is already running (pid {existing_pid}), remaining {humanize_seconds(rem)}")
+        # Verify the PID actually belongs to this blocker; otherwise, treat as stale
+        if not pid_looks_like_blocker(existing_pid):
+            remove_pid_file()
+        else:
+            existing_state = read_state()
+            rem = compute_remaining_seconds_from_state(existing_state) or 0
+            if rem <= 0:
+                # If there is no active block state and no active hosts/PF rules, pidfile is stale
+                try:
+                    hosts_content = read_hosts()
+                    has_hosts = HOSTS_START_MARK in hosts_content and HOSTS_END_MARK in hosts_content
+                except Exception:
+                    has_hosts = False
+                try:
+                    pf_rules = run_cmd(["/sbin/pfctl", "-a", PF_ANCHOR_NAME, "-s", "rules"], check=False)
+                    pf_rules_text = (pf_rules.stdout or "") + (pf_rules.stderr or "")
+                    has_pf_rules = (
+                        pf_rules.returncode == 0
+                        and bool(pf_rules_text.strip())
+                        and not pf_rules_text.strip().startswith("No ALTQ support")
+                    )
+                except Exception:
+                    has_pf_rules = False
+                if not has_hosts and not has_pf_rules:
+                    remove_pid_file()
+                else:
+                    sys.exit(f"A block daemon is already running (pid {existing_pid}), remaining {humanize_seconds(rem)}")
+            else:
+                sys.exit(f"A block daemon is already running (pid {existing_pid}), remaining {humanize_seconds(rem)}")
     elif existing_pid and not pid_is_running(existing_pid):
         remove_pid_file()
 
@@ -511,6 +585,11 @@ def do_block(opts: BlockOptions) -> None:
     if opts.use_pf:
         v4, v6 = resolve_domain_ips(normalized_domains)
         pf_enable()
+        # Ensure PF is actually enabled before proceeding
+        for _ in range(10):
+            if pf_is_enabled():
+                break
+            time.sleep(0.1)
         modified_pfconf = pf_ensure_anchor_in_pfconf()
         pf_write_anchor_rules(v4, v6)
         pf_load_rules()
@@ -614,6 +693,9 @@ def do_unblock() -> None:
     flush_dns_cache()
 
     remove_state()
+    # Ensure any stale pidfile is cleared as part of manual unblock
+    with contextlib.suppress(Exception):
+        remove_pid_file()
     print("Unblocked websites and cleaned up hosts and PF rules.")
 
 
@@ -625,9 +707,8 @@ def do_status() -> None:
     hosts_content = read_hosts()
     has_block = HOSTS_START_MARK in hosts_content and HOSTS_END_MARK in hosts_content
     hosts_flag = is_hosts_immutable()
-    pf_enabled = pf_is_enabled()
-    pf_rules = run_cmd(["/sbin/pfctl", "-a", PF_ANCHOR_NAME, "-s", "rules"], check=False)
-    has_pf_rules = bool(pf_rules.stdout.strip()) and not pf_rules.stdout.strip().startswith("No ALTQ support")
+    pf_enabled_opt = pf_enabled_status_unprivileged()
+    has_pf_rules_opt = pf_anchor_rules_present_unprivileged()
     pid = read_pid_file()
     pid_running = bool(pid and pid_is_running(pid))
     remaining = compute_remaining_seconds_from_state(state) if state else None
@@ -635,8 +716,8 @@ def do_status() -> None:
     print("Status:")
     print(f"- hosts block present: {has_block}")
     print(f"- hosts immutable: {hosts_flag}")
-    print(f"- pf enabled: {pf_enabled}")
-    print(f"- pf anchor rules present: {has_pf_rules}")
+    print(f"- pf enabled: {pf_enabled_opt if pf_enabled_opt is not None else 'unknown (run as root)'}")
+    print(f"- pf anchor rules present: {has_pf_rules_opt if has_pf_rules_opt is not None else 'unknown (run as root)'}")
     print(f"- daemon pid: {pid if pid else 'none'} (running: {pid_running})")
     if remaining is not None:
         print(f"- remaining: {humanize_seconds(remaining)}")
@@ -671,7 +752,12 @@ def cleanup_dangling_blocks_if_no_state() -> bool:
 
     try:
         pf_rules = run_cmd(["/sbin/pfctl", "-a", PF_ANCHOR_NAME, "-s", "rules"], check=False)
-        has_pf_rules = bool(pf_rules.stdout.strip()) and not pf_rules.stdout.strip().startswith("No ALTQ support")
+        pf_rules_text = (pf_rules.stdout or "") + (pf_rules.stderr or "")
+        has_pf_rules = (
+            pf_rules.returncode == 0
+            and bool(pf_rules_text.strip())
+            and not pf_rules_text.strip().startswith("No ALTQ support")
+        )
         if has_pf_rules:
             pf_clear_anchor_rules()
             changed = True
@@ -681,6 +767,9 @@ def cleanup_dangling_blocks_if_no_state() -> bool:
     if changed:
         with contextlib.suppress(Exception):
             flush_dns_cache()
+    # Always clear pidfile if no state is present (prevents stale PID reuse issues)
+    with contextlib.suppress(Exception):
+        remove_pid_file()
     return changed
 
 
