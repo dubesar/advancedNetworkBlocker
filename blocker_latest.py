@@ -24,6 +24,7 @@ import subprocess
 import sys
 import time
 from typing import Iterable, List, Optional, Sequence, Set, Tuple
+from urllib.parse import urlsplit
 
 
 # ---------- Constants ----------
@@ -67,13 +68,37 @@ def now_iso() -> str:
 
 def normalize_domain(domain: str) -> str:
     """Normalize a domain string to a bare hostname.
-    - strips scheme (http/https), path/query
+    - strips scheme (http/https), path/query/fragment/port
     - lowercases
     - removes a trailing dot
+    - preserves IP literals as-is
     """
     d = domain.strip().lower()
-    d = re.sub(r"^https?://", "", d)
-    d = d.split("/")[0]
+    # Remove scheme if present
+    d = re.sub(r"^([a-z][a-z0-9+.-]*://)", "", d)
+    # Trim path and fragments if any
+    d = d.split('/')[0]
+    d = d.split('#')[0]
+    d = d.split('?', 1)[0]
+
+    # Handle bracketed IPv6 like [2001:db8::1]:443
+    if d.startswith('['):
+        end = d.find(']')
+        if end != -1:
+            maybe_ip = d[1:end]
+            with contextlib.suppress(ValueError):
+                ipaddress.ip_address(maybe_ip)
+                return maybe_ip
+
+    # If it's an IP literal, keep it unchanged
+    with contextlib.suppress(ValueError):
+        ipaddress.ip_address(d)
+        return d
+
+    # Otherwise, drop optional :port
+    if ':' in d:
+        d = d.split(':', 1)[0]
+
     if d.endswith('.'):
         d = d[:-1]
     return d
@@ -81,7 +106,8 @@ def normalize_domain(domain: str) -> str:
 
 def is_subdomain(domain: str) -> bool:
       labels = domain.split('.')
-      # 3+ labels = subdomain, but exclude www.example.com
+      # Heuristic only: 3+ labels = subdomain, but exclude www.example.com
+      # Note: This does not consult the Public Suffix List (e.g., co.uk).
       return len(labels) >= 3 and not domain.startswith('www.')
 
 
@@ -242,8 +268,12 @@ def write_hosts(content: str) -> None:
 
 
 def remove_marked_block(text: str) -> Tuple[str, bool]:
+    """Remove the managed hosts block without eating the preceding newline.
+    This preserves surrounding lines so content before and after the block
+    does not get merged together when the block is removed.
+    """
     pattern = re.compile(
-        rf"\n?{re.escape(HOSTS_START_MARK)}[\s\S]*?{re.escape(HOSTS_END_MARK)}\n?",
+        rf"{re.escape(HOSTS_START_MARK)}[\s\S]*?{re.escape(HOSTS_END_MARK)}\n?",
         re.MULTILINE,
     )
     new_text, n = pattern.subn("", text)
@@ -256,6 +286,10 @@ def make_hosts_block(domains: Sequence[str]) -> str:
         f"# Added at {now_iso()} by website_blocker.py",
     ]
     for dom in domains:
+        # Skip IP literals in hosts; PF handles IP-level blocking
+        with contextlib.suppress(ValueError):
+            ipaddress.ip_address(dom)
+            continue
         lines.append(f"127.0.0.1 {dom}")
         lines.append(f"::1 {dom}")
     lines.append(HOSTS_END_MARK)
@@ -484,10 +518,27 @@ def compute_remaining_seconds_from_state(state: dict) -> Optional[int]:
         return None
 
 
-def resume_daemon_if_needed(state: Optional[dict] = None, clean_on_expiry: bool = False) -> Optional[int]:
+def resume_daemon_if_needed(
+    state: Optional[dict] = None,
+    clean_on_expiry: bool = False,
+    allow_daemonize: Optional[bool] = None,
+) -> Optional[int]:
+    """Ensure a scheduler exists if there is remaining time.
+    - If remaining <= 0: optionally perform cleanup (root only).
+    - If remaining > 0: start a daemon only when running as root (by default).
+    This prevents non-root `status` runs from spawning a daemon that cannot
+    successfully unblock later.
+    """
     state = state or read_state()
     if not state:
         return None
+
+    # Default policy: only root may daemonize
+    if allow_daemonize is None:
+        try:
+            allow_daemonize = (os.geteuid() == 0)
+        except Exception:
+            allow_daemonize = False
 
     remaining = compute_remaining_seconds_from_state(state)
     pid = read_pid_file()
@@ -503,10 +554,11 @@ def resume_daemon_if_needed(state: Optional[dict] = None, clean_on_expiry: bool 
     if pid and pid_is_running(pid):
         return remaining
 
-    try:
-        daemonize_and_schedule_unblock(remaining, detach_parent=False)
-    except Exception:
-        pass
+    if allow_daemonize:
+        try:
+            daemonize_and_schedule_unblock(remaining, detach_parent=False)
+        except Exception:
+            pass
     return remaining
 
 
@@ -712,6 +764,9 @@ def do_unblock() -> None:
 
 
 def do_status() -> None:
+    if not is_macos():
+        print("Status is only supported on macOS (Darwin).")
+        return
     # Clean up if prior state vanished but blocks remain (root only)
     cleanup_dangling_blocks_if_no_state()
     state = read_state()
@@ -789,8 +844,17 @@ def cleanup_dangling_blocks_if_no_state() -> bool:
 
 def read_domains_from_file(path: str) -> List[str]:
     with open(path, "r", encoding="utf-8") as f:
-        domains = [line.strip() for line in f]
-    return [d for d in domains if d and not d.startswith("#")]
+        raw = [line.rstrip() for line in f]
+    cleaned: List[str] = []
+    for line in raw:
+        # Strip inline comments and whitespace
+        line = re.split(r"\s*#", line, maxsplit=1)[0].strip()
+        if not line:
+            continue
+        nd = normalize_domain(line)
+        if nd:
+            cleaned.append(nd)
+    return cleaned
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -871,4 +935,3 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
-
