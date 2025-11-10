@@ -737,11 +737,9 @@ def do_unblock() -> None:
 
     if use_pf:
         pf_clear_anchor_rules()
-        # Restore PF enabled state only if we had enabled it
-        pf_prev = state.get("pf_was_enabled_before")
-        if pf_prev is False:
-            with contextlib.suppress(Exception):
-                pf_disable()
+        # Always disable PF after unblock
+        with contextlib.suppress(Exception):
+            pf_disable()
 
     # Flush DNS caches so changes take effect immediately
     flush_dns_cache()
