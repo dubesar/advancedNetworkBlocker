@@ -36,6 +36,9 @@ PF_ANCHOR_NAME: str = "website-blocker"
 PF_ANCHOR_FILE: str = f"/etc/pf.anchors/{PF_ANCHOR_NAME}"
 PF_CONF_FILE: str = "/etc/pf.conf"
 
+LAUNCHD_LABEL: str = "com.dubesar.website.blocker"
+LAUNCHD_PLIST: str = f"/Library/LaunchDaemons/{LAUNCHD_LABEL}.plist"
+
 # State file to preserve original flags and context across a timed block
 STATE_DIR: str = "/var/run/website_blocker"
 STATE_FILE: str = f"{STATE_DIR}/state.json"
@@ -59,6 +62,15 @@ def run_cmd(cmd: Sequence[str], check: bool = True) -> subprocess.CompletedProce
     if check and result.returncode != 0:
         raise RuntimeError(f"Command failed ({result.returncode}): {shlex.join(cmd)}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
     return result
+
+
+def get_boot_id() -> str:
+    """Return a unique ID for the current boot session (kern.uuid)."""
+    try:
+        return run_cmd(["/usr/sbin/sysctl", "-n", "kern.uuid"]).stdout.strip()
+    except Exception:
+        # Fallback if sysctl fails, though unlikely on macOS
+        return "unknown-boot-id"
 
 
 def now_iso() -> str:
@@ -165,7 +177,44 @@ def read_state() -> dict:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
+        # Attempt to recover state from hosts file to prevent easy bypass
+        recovered = recover_state_from_hosts()
+        if recovered:
+            # Restore the state file
+            try:
+                write_state(recovered)
+            except Exception:
+                pass
+            return recovered
         return {}
+
+
+def recover_state_from_hosts() -> Optional[dict]:
+    """Recover state from metadata embedded in the hosts file block."""
+    try:
+        content = read_hosts()
+        pattern = re.compile(
+            rf"{re.escape(HOSTS_START_MARK)}([\s\S]*?){re.escape(HOSTS_END_MARK)}",
+            re.MULTILINE,
+        )
+        match = pattern.search(content)
+        if not match:
+            return None
+        
+        block_content = match.group(1)
+        # Look for JSON metadata
+        meta_match = re.search(r"# METADATA: ({.*})", block_content)
+        if meta_match:
+            try:
+                return json.loads(meta_match.group(1))
+            except json.JSONDecodeError:
+                pass
+                
+        # Fallback: If no metadata (legacy block), we can't fully recover duration,
+        # but we could infer domains. For now, return None to allow cleanup of legacy blocks.
+        return None
+    except Exception:
+        return None
 
 
 def remove_state() -> None:
@@ -227,6 +276,71 @@ def pid_looks_like_blocker(pid: int) -> bool:
     except Exception:
         return False
 
+
+def manage_launchd_plist(enable: bool) -> bool:
+    """Create or remove a LaunchDaemon to ensure the blocker resumes after reboot.
+    Returns True if a change was made (created or removed).
+    """
+    if not is_macos():
+        return False
+
+    changed = False
+    if enable:
+        # Create plist that runs 'status' on load (which resumes the daemon if needed)
+        script_path = os.path.abspath(sys.argv[0])
+        python_path = sys.executable
+        
+        plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LAUNCHD_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python_path}</string>
+        <string>{script_path}</string>
+        <string>status</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/var/log/website_blocker.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/website_blocker.log</string>
+</dict>
+</plist>
+"""
+        try:
+            # Only write if content differs or file missing
+            should_write = True
+            if os.path.exists(LAUNCHD_PLIST):
+                with open(LAUNCHD_PLIST, "r", encoding="utf-8") as f:
+                    if f.read() == plist_content:
+                        should_write = False
+            
+            if should_write:
+                with open(LAUNCHD_PLIST, "w", encoding="utf-8") as f:
+                    f.write(plist_content)
+                # Set permissions to root:wheel 644
+                os.chmod(LAUNCHD_PLIST, 0o644)
+                run_cmd(["/bin/launchctl", "load", "-w", LAUNCHD_PLIST], check=False)
+                changed = True
+        except Exception:
+            pass
+            
+    else:
+        # Remove plist
+        if os.path.exists(LAUNCHD_PLIST):
+            with contextlib.suppress(Exception):
+                run_cmd(["/bin/launchctl", "unload", "-w", LAUNCHD_PLIST], check=False)
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(LAUNCHD_PLIST)
+            changed = True
+
+    return changed
+
+
 # ---------- /etc/hosts management ----------
 
 def is_hosts_immutable() -> bool:
@@ -279,11 +393,14 @@ def remove_marked_block(text: str) -> Tuple[str, bool]:
     return new_text, n > 0
 
 
-def make_hosts_block(domains: Sequence[str]) -> str:
-    lines = [
-        HOSTS_START_MARK,
-        f"# Added at {now_iso()} by blocker_latest.py",
-    ]
+def make_hosts_block(domains: Sequence[str], metadata: Optional[dict] = None) -> str:
+    lines = [HOSTS_START_MARK]
+    if metadata:
+        # Serialize metadata to a single line JSON comment
+        lines.append(f"# METADATA: {json.dumps(metadata)}")
+    else:
+        lines.append(f"# Added at {now_iso()} by blocker_latest.py")
+    
     for dom in domains:
         # Skip IP literals in hosts; PF handles IP-level blocking
         with contextlib.suppress(ValueError):
@@ -295,14 +412,14 @@ def make_hosts_block(domains: Sequence[str]) -> str:
     return "\n" + "\n".join(lines) + "\n"
 
 
-def apply_hosts_block(domains: Sequence[str], make_immutable: bool) -> dict:
+def apply_hosts_block(domains: Sequence[str], make_immutable: bool, metadata: Optional[dict] = None) -> dict:
     prev_immutable = is_hosts_immutable()
     if prev_immutable:
         # Temporarily unlock to modify
         set_hosts_immutable(False)
     original = read_hosts()
     without_block, _ = remove_marked_block(original)
-    updated = without_block.rstrip("\n") + make_hosts_block(domains)
+    updated = without_block.rstrip("\n") + make_hosts_block(domains, metadata=metadata)
     write_hosts(updated)
     if make_immutable:
         set_hosts_immutable(True)
@@ -491,9 +608,23 @@ def humanize_seconds(total_seconds: int) -> str:
 
 def compute_remaining_seconds_from_state(state: dict) -> Optional[int]:
     try:
-        start_iso = state.get("start_time")
         duration = int(state.get("duration_seconds")) if state.get("duration_seconds") is not None else None
-        if not start_iso or duration is None:
+        if duration is None:
+            return None
+
+        # Monotonic check (robust against wall-clock changes)
+        start_boot_id = state.get("boot_id")
+        start_monotonic = state.get("start_monotonic")
+        current_boot_id = get_boot_id()
+
+        if start_boot_id and start_monotonic is not None and start_boot_id == current_boot_id:
+            elapsed = time.monotonic() - float(start_monotonic)
+            remaining = duration - elapsed
+            return max(0, int(remaining))
+
+        # Fallback to wall-clock if rebooted or legacy state
+        start_iso = state.get("start_time")
+        if not start_iso:
             return None
         start_dt = dt.datetime.fromisoformat(start_iso)
         now_dt = dt.datetime.now().astimezone()
@@ -616,8 +747,12 @@ def do_block(opts: BlockOptions) -> None:
     state = {}
     normalized_domains = expand_www_variants(opts.domains)
 
+    start_time_iso = now_iso()
     state = {
-        "start_time": now_iso(),
+        "start_time": start_time_iso,
+        # Monotonic timestamp and boot ID make us resilient to wall-clock skew
+        "start_monotonic": time.monotonic(),
+        "boot_id": get_boot_id(),
         "domains": normalized_domains,
         "use_hosts": opts.use_hosts,
         "use_pf": opts.use_pf,
@@ -625,11 +760,47 @@ def do_block(opts: BlockOptions) -> None:
     }
 
     if opts.use_hosts:
-        hosts_info = apply_hosts_block(normalized_domains, make_immutable=opts.make_hosts_immutable)
+        # Pass the core state as metadata to be embedded in the hosts file
+        # Smart detection of "sticky" immutability:
+        # If hosts is immutable AND already contains our markers, it implies the real state 
+        # before WE touched it was likely mutable (or we locked it in a prev run).
+        # If immutable but NO markers -> User locked it.
+        real_immutable_before = is_hosts_immutable()
+        if real_immutable_before:
+            content = read_hosts()
+            if HOSTS_START_MARK in content:
+                real_immutable_before = False
+        
+        # Manually apply block with our corrected 'before' state
+        # (We duplicate logic of apply_hosts_block partly to inject the corrected bool)
+        if real_immutable_before:
+            set_hosts_immutable(False)
+            
+        original = read_hosts()
+        without_block, _ = remove_marked_block(original)
+        # Update state object with "before" status so it can be embedded
+        state["hosts_immutable_before"] = real_immutable_before
+        
+        updated = without_block.rstrip("\n") + make_hosts_block(normalized_domains, metadata=state)
+        write_hosts(updated)
+        if opts.make_hosts_immutable:
+            set_hosts_immutable(True)
+            
+        hosts_info = {"hosts_immutable_before": real_immutable_before}
         state.update(hosts_info)
 
     if opts.use_pf:
+        # Smart detection of "sticky" PF state:
+        # If PF is enabled, check if our anchor has rules. If so, we likely enabled it.
         pf_was_enabled_before = pf_is_enabled()
+        if pf_was_enabled_before:
+            # Check if our anchor has rules (requires root usually, which we are)
+            # If our anchor is active, we assume we are responsible for PF being On.
+            # This prevents sticky "PF On" state across re-blocks.
+            has_our_rules = pf_anchor_rules_present_unprivileged() # returns True/False/None
+            if has_our_rules is True:
+                pf_was_enabled_before = False
+
         v4, v6 = resolve_domain_ips(normalized_domains)
         pf_enable()
         # Ensure PF is actually enabled before proceeding
@@ -652,6 +823,7 @@ def do_block(opts: BlockOptions) -> None:
     flush_dns_cache()
     
     print(f"Blocking {len(normalized_domains)} domains for {opts.duration_seconds} seconds (detached)")
+    manage_launchd_plist(True)
     daemonize_and_schedule_unblock(opts.duration_seconds)
 
 def daemonize_and_schedule_unblock(after_seconds: int, detach_parent: bool = True) -> None:
@@ -733,13 +905,23 @@ def do_unblock() -> None:
         restore_immutable = bool(state["hosts_immutable_before"])  # restore prior immutable state
 
     if use_hosts:
-        remove_hosts_block(restore_immutable=restore_immutable)
+        # Default to False (mutable) if state is missing, as standard /etc/hosts is mutable by root
+        restore_val = False
+        if "hosts_immutable_before" in state:
+            restore_val = bool(state["hosts_immutable_before"])
+        
+        remove_hosts_block(restore_immutable=restore_val)
 
     if use_pf:
         pf_clear_anchor_rules()
-        # Always disable PF after unblock
-        with contextlib.suppress(Exception):
-            pf_disable()
+        # Only disable PF if it was explicitly disabled before, or if state is missing (assume disabled by default on macOS)
+        should_disable = True
+        if "pf_was_enabled_before" in state:
+            should_disable = not bool(state["pf_was_enabled_before"])
+        
+        if should_disable:
+            with contextlib.suppress(Exception):
+                pf_disable()
 
     # Flush DNS caches so changes take effect immediately
     flush_dns_cache()
@@ -748,6 +930,7 @@ def do_unblock() -> None:
     # Ensure any stale pidfile is cleared as part of manual unblock
     with contextlib.suppress(Exception):
         remove_pid_file()
+    manage_launchd_plist(False)
     print("Unblocked websites and cleaned up hosts and PF rules.")
 
 
@@ -800,7 +983,14 @@ def cleanup_dangling_blocks_if_no_state() -> bool:
         has_block = HOSTS_START_MARK in hosts_content and HOSTS_END_MARK in hosts_content
         if has_block:
             # Preserve current immutability behavior inside remove_hosts_block
-            remove_hosts_block(restore_immutable=None)
+            # Force mutable (False) because we are cleaning up a dangling/broken block
+            remove_hosts_block(restore_immutable=False)
+            changed = True
+        elif is_hosts_immutable():
+            # Edge case: File is immutable but has no block markers (orphaned lock).
+            # This happens if a previous unblock cleared the text but failed to unlock.
+            # We unlock it to restore normal system state.
+            set_hosts_immutable(False)
             changed = True
     except Exception:
         pass
@@ -822,9 +1012,21 @@ def cleanup_dangling_blocks_if_no_state() -> bool:
     if changed:
         with contextlib.suppress(Exception):
             flush_dns_cache()
+    
+    if manage_launchd_plist(False):
+        changed = True
+    
     # Always clear pidfile if no state is present (prevents stale PID reuse issues)
     with contextlib.suppress(Exception):
         remove_pid_file()
+
+    # If we performed ANY cleanup (hosts, rules, or plist), it means we likely
+    # left the system in a "blocked" state previously.
+    # Ensure PF is disabled in this case to return to a clean state.
+    if changed:
+        with contextlib.suppress(Exception):
+            pf_disable()
+
     return changed
 
 
