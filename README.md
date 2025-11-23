@@ -27,3 +27,18 @@ The log shows remaining time every minute: `XX.X minutes remaining`
 ps aux | grep blocker.py
 ```
 This shows when the process started. Calculate remaining time based on the duration you specified.
+
+
+### Using blocker.go
+1. Build the binary:
+```bash
+go build -o blocker blocker.go
+```
+2. Run the binary:
+```bash
+sudo ./blocker block -duration 60m twitter.com facebook.com instagram.com
+```
+3. Check the status:
+```bash
+sudo ./blocker status
+```
