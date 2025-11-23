@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -221,43 +222,52 @@ func runDaemon() {
 	ticker := time.NewTicker(CheckInterval)
 	lastCheck := time.Now().Unix()
 	for range ticker.C {
-		s, err := loadState()
-		if err != nil {
-			// If state unavailable or signature invalid, do NOT cleanup. Alert and continue.
-			fmt.Printf("[daemon] loadState error: %v\n", err)
-			continue
-		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Printf("[daemon] panic recovered: %v\n", r)
+					fmt.Printf("[daemon] stack trace:\n%s\n", debug.Stack())
+				}
+			}()
 
-		// Detect clock tamper: if system time is earlier than saved start by >1 minute -> tamper
-		now := time.Now().Unix()
-		if now < s.StartUnix-60 {
-			fmt.Printf("[daemon] system clock appears to have been set backwards (saved %d, now %d). Refusing to cleanup.\n", s.StartUnix, now)
-			continue
-		}
-
-		delta := now - lastCheck
-		if delta > int64(ForwardJumpThreshold.Seconds()) {
-			fmt.Printf("[daemon] detected long inactivity or clock jump (last %d, now %d, delta %d). Treating as inactive time; extending block.\n", lastCheck, now, delta)
-			s.EndUnix += delta
-			if err := saveState(s); err != nil {
-				fmt.Printf("[daemon] failed to save adjusted state: %v\n", err)
+			s, err := loadState()
+			if err != nil {
+				// If state unavailable or signature invalid, do NOT cleanup. Alert and continue.
+				fmt.Printf("[daemon] loadState error: %v\n", err)
+				return
 			}
-		}
 
-		// Check for expiry
-		if now >= s.EndUnix {
-			cleanupAndExit(s)
-		}
+			// Detect clock tamper: if system time is earlier than saved start by >1 minute -> tamper
+			now := time.Now().Unix()
+			if now < s.StartUnix-60 {
+				fmt.Printf("[daemon] system clock appears to have been set backwards (saved %d, now %d). Refusing to cleanup.\n", s.StartUnix, now)
+				return
+			}
 
-		// Self-Healing: Verify integrity based on enforcement mode
-		// If user managed to edit the file or PF rules, we revert them.
-		if s.UsePF {
-			ensurePFIntegrity(s.Domains)
-		} else {
-			ensureHostsIntegrity(s.Domains)
-		}
+			delta := now - lastCheck
+			if delta > int64(ForwardJumpThreshold.Seconds()) {
+				fmt.Printf("[daemon] detected long inactivity or clock jump (last %d, now %d, delta %d). Treating as inactive time; extending block.\n", lastCheck, now, delta)
+				s.EndUnix += delta
+				if err := saveState(s); err != nil {
+					fmt.Printf("[daemon] failed to save adjusted state: %v\n", err)
+				}
+			}
 
-		lastCheck = now
+			// Check for expiry
+			if now >= s.EndUnix {
+				cleanupAndExit(s)
+			}
+
+			// Self-Healing: Verify integrity based on enforcement mode
+			// If user managed to edit the file or PF rules, we revert them.
+			if s.UsePF {
+				ensurePFIntegrity(s.Domains)
+			} else {
+				ensureHostsIntegrity(s.Domains)
+			}
+
+			lastCheck = now
+		}()
 	}
 }
 
@@ -299,7 +309,19 @@ func showStatus() {
 	end := time.Unix(s.EndUnix, 0)
 	remaining := time.Until(end)
 	if remaining <= 0 {
-		fmt.Println("Block duration has elapsed; waiting for automatic unblock.")
+		out, err := exec.Command("launchctl", "list").Output()
+		if err == nil && strings.Contains(string(out), PlistLabel) {
+			fmt.Println("⏰ Block expired. Automatic cleanup in progress...")
+		} else {
+			if _, err := os.Stat(HostsFile); err == nil {
+				content, _ := os.ReadFile(HostsFile)
+				if !strings.Contains(string(content), StartMarker) {
+					fmt.Println("✅ Block expired and automatically cleaned up.")
+					return
+				}
+			}
+			fmt.Println("⚠️  Block expired but cleanup incomplete. Run: sudo ./blocker unblock")
+		}
 		return
 	}
 	fmt.Println("🔒 Block is active.")
@@ -312,13 +334,23 @@ func showStatus() {
 
 func ensureHostsIntegrity(domains []string) {
 	// Acquire lock while operating
-	f, err := lockFile(HostsFile)
+	f, err := lockFileReadOnly(HostsFile)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			if err := applyHostsBlock(domains); err != nil {
+				fmt.Printf("[ensureHostsIntegrity] failed applyHostsBlock: %v\n", err)
+			}
+			return
+		}
 		// can't lock, bail out
 		fmt.Printf("[ensureHostsIntegrity] failed lock: %v\n", err)
 		return
 	}
-	defer unlockFile(f)
+	defer func() {
+		if f != nil {
+			_ = unlockFile(f)
+		}
+	}()
 
 	content, err := os.ReadFile(HostsFile)
 	if err != nil {
@@ -329,7 +361,8 @@ func ensureHostsIntegrity(domains []string) {
 
 	// If our block is missing or corrupted
 	if !strings.Contains(sContent, StartMarker) || !strings.Contains(sContent, EndMarker) {
-		// Unlock, Rewrite, Lock
+		_ = unlockFile(f)
+		f = nil
 		if err := applyHostsBlock(domains); err != nil {
 			fmt.Printf("[ensureHostsIntegrity] failed applyHostsBlock: %v\n", err)
 		}
@@ -339,8 +372,8 @@ func ensureHostsIntegrity(domains []string) {
 	// Ensure immutable flag is set (User cannot edit)
 	if !isImmutable() {
 		if err := setImmutable(true); err != nil {
-			fmt.Printf("[ensureHostsIntegrity] setImmutable err: %v\n", err)
-			os.Exit(1)
+			fmt.Printf("[ensureHostsIntegrity] setImmutable err: %v. Will retry.\n", err)
+			return
 		}
 	}
 }
@@ -548,13 +581,25 @@ func installPlist(exePath string) error {
         <string>daemon</string>
     </array>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-	    <string>%s</string>
+        <string>%s</string>
     <key>StandardErrorPath</key>
-	    <string>%s</string>
+        <string>%s</string>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>1024</integer>
+    </dict>
 </dict>
 </plist>`, PlistLabel, exePath, LogFilePath, LogFilePath)
 
@@ -632,6 +677,7 @@ func ensureDir(dir string) error {
 func removeStateFiles() error {
 	_ = os.Remove(StateFile)
 	_ = os.Remove(StateSigFile)
+	_ = os.Remove(StateLockFile)
 	return nil
 }
 
@@ -737,6 +783,19 @@ func verifySig(data []byte, sig string) (bool, error) {
 }
 
 // --- file lock ---
+
+func lockFileReadOnly(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY, 0600)
+	if err != nil {
+		return nil, err
+	}
+	fd := f.Fd()
+	if err := syscall.Flock(int(fd), syscall.LOCK_SH); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
 
 func lockFile(path string) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0600)
