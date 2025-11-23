@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"math/big"
 	"net"
 	"os"
@@ -131,6 +132,21 @@ func ensureLogRotation() {
 	_ = atomicWrite(NewsyslogConfPath, []byte(line), 0644)
 }
 
+func killExistingDaemons() {
+	_ = exec.Command("launchctl", "unload", "-w", PlistPath).Run()
+
+	out, _ := exec.Command("pgrep", "-f", "blocker daemon").Output()
+	pids := strings.Split(strings.TrimSpace(string(out)), "\n")
+
+	for _, pid := range pids {
+		if pid != "" && pid != fmt.Sprintf("%d", os.Getpid()) {
+			_ = exec.Command("kill", "-9", pid).Run()
+		}
+	}
+
+	time.Sleep(500 * time.Millisecond)
+}
+
 // --- High Level Commands ---
 
 func startBlock(domains []string, duration time.Duration, usePF bool) {
@@ -151,6 +167,8 @@ func startBlock(domains []string, duration time.Duration, usePF bool) {
 			os.Exit(1)
 		}
 	}
+
+	killExistingDaemons()
 
 	// Validate domains
 	for _, d := range domains {
@@ -208,6 +226,14 @@ func startBlock(domains []string, duration time.Duration, usePF bool) {
 }
 
 func runDaemon() {
+	logFile, err := os.OpenFile(LogFilePath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Printf("[daemon] Failed to open log file: %v\n", err)
+	} else {
+		log.SetOutput(logFile)
+		defer logFile.Close()
+	}
+
 	// 1. Ignore Termination Signals (Self-Defense)
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
@@ -221,35 +247,42 @@ func runDaemon() {
 	// 2. Watchdog Loop
 	ticker := time.NewTicker(CheckInterval)
 	lastCheck := time.Now().Unix()
+	consecutiveErrors := 0
+	maxConsecutiveErrors := 30
 	for range ticker.C {
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					fmt.Printf("[daemon] panic recovered: %v\n", r)
-					fmt.Printf("[daemon] stack trace:\n%s\n", debug.Stack())
+					log.Printf("[daemon] panic recovered: %v\n", r)
+					log.Printf("[daemon] stack trace:\n%s\n", debug.Stack())
 				}
 			}()
 
 			s, err := loadState()
 			if err != nil {
 				// If state unavailable or signature invalid, do NOT cleanup. Alert and continue.
-				fmt.Printf("[daemon] loadState error: %v\n", err)
+				consecutiveErrors++
+				log.Printf("[daemon] loadState error: %v (count: %d)\n", err, consecutiveErrors)
+				if consecutiveErrors >= maxConsecutiveErrors {
+					log.Printf("[daemon] Exiting due to persistent state errors\n")
+					os.Exit(0)
+				}
 				return
 			}
 
 			// Detect clock tamper: if system time is earlier than saved start by >1 minute -> tamper
 			now := time.Now().Unix()
 			if now < s.StartUnix-60 {
-				fmt.Printf("[daemon] system clock appears to have been set backwards (saved %d, now %d). Refusing to cleanup.\n", s.StartUnix, now)
+				log.Printf("[daemon] system clock appears to have been set backwards (saved %d, now %d). Refusing to cleanup.\n", s.StartUnix, now)
 				return
 			}
 
 			delta := now - lastCheck
 			if delta > int64(ForwardJumpThreshold.Seconds()) {
-				fmt.Printf("[daemon] detected long inactivity or clock jump (last %d, now %d, delta %d). Treating as inactive time; extending block.\n", lastCheck, now, delta)
+				log.Printf("[daemon] detected long inactivity or clock jump (last %d, now %d, delta %d). Treating as inactive time; extending block.\n", lastCheck, now, delta)
 				s.EndUnix += delta
 				if err := saveState(s); err != nil {
-					fmt.Printf("[daemon] failed to save adjusted state: %v\n", err)
+					log.Printf("[daemon] failed to save adjusted state: %v\n", err)
 				}
 			}
 
@@ -267,6 +300,7 @@ func runDaemon() {
 			}
 
 			lastCheck = now
+			consecutiveErrors = 0
 		}()
 	}
 }
