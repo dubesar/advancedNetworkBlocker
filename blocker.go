@@ -316,7 +316,8 @@ func showStatus() {
 			if _, err := os.Stat(HostsFile); err == nil {
 				content, _ := os.ReadFile(HostsFile)
 				if !strings.Contains(string(content), StartMarker) {
-					fmt.Println("✅ Block expired and automatically cleaned up.")
+					_ = removeStateFiles()
+					fmt.Println("No active block.")
 					return
 				}
 			}
@@ -334,35 +335,23 @@ func showStatus() {
 
 func ensureHostsIntegrity(domains []string) {
 	// Acquire lock while operating
-	f, err := lockFileReadOnly(HostsFile)
+	content, err := os.ReadFile(HostsFile)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			_ = setImmutable(false)
 			if err := applyHostsBlock(domains); err != nil {
 				fmt.Printf("[ensureHostsIntegrity] failed applyHostsBlock: %v\n", err)
 			}
-			return
+		} else {
+			fmt.Printf("[ensureHostsIntegrity] read hosts err: %v\n", err)
 		}
-		// can't lock, bail out
-		fmt.Printf("[ensureHostsIntegrity] failed lock: %v\n", err)
-		return
-	}
-	defer func() {
-		if f != nil {
-			_ = unlockFile(f)
-		}
-	}()
-
-	content, err := os.ReadFile(HostsFile)
-	if err != nil {
-		fmt.Printf("[ensureHostsIntegrity] read hosts err: %v\n", err)
 		return
 	}
 	sContent := string(content)
 
 	// If our block is missing or corrupted
 	if !strings.Contains(sContent, StartMarker) || !strings.Contains(sContent, EndMarker) {
-		_ = unlockFile(f)
-		f = nil
+		_ = setImmutable(false)
 		if err := applyHostsBlock(domains); err != nil {
 			fmt.Printf("[ensureHostsIntegrity] failed applyHostsBlock: %v\n", err)
 		}
@@ -386,17 +375,17 @@ func ensurePFIntegrity(domains []string) {
 
 func applyHostsBlock(domains []string) error {
 	// Acquire lock
-	f, err := lockFile(HostsFile)
-	if err != nil {
-		return err
-	}
-	defer unlockFile(f)
-
 	if err := setImmutable(false); err != nil {
 		// log but continue
 		fmt.Printf("[applyHostsBlock] failed to unset immutable: %v\n", err)
 		return err
 	}
+
+	f, err := lockFile(HostsFile)
+	if err != nil {
+		return err
+	}
+	defer unlockFile(f)
 
 	// Resolve symlinks to canonical path
 	realPath, _ := filepath.EvalSymlinks(HostsFile)
@@ -448,14 +437,14 @@ func cleanupAndExit(s State) {
 	}
 
 	// Hosts cleanup
-	f, err := lockFile(HostsFile)
-	if err == nil {
-		defer unlockFile(f)
-	}
-
 	if err := setImmutable(false); err != nil {
 		fmt.Printf("[cleanupAndExit] failed to unset immutable: %v\n", err)
 		// non-fatal: log but continue cleanup
+	}
+
+	f, err := lockFile(HostsFile)
+	if err == nil {
+		defer unlockFile(f)
 	}
 
 	content, _ := os.ReadFile(HostsFile)
