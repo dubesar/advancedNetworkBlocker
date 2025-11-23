@@ -248,7 +248,9 @@ func runDaemon() {
 	ticker := time.NewTicker(CheckInterval)
 	lastCheck := time.Now().Unix()
 	consecutiveErrors := 0
+	consecutiveIntegrityFailures := 0
 	maxConsecutiveErrors := 30
+	maxIntegrityFailures := 10
 	for range ticker.C {
 		func() {
 			defer func() {
@@ -293,14 +295,32 @@ func runDaemon() {
 
 			// Self-Healing: Verify integrity based on enforcement mode
 			// If user managed to edit the file or PF rules, we revert them.
+			// NEW: Track failures and exit if enforcement becomes impossible.
+			var integrityErr error
 			if s.UsePF {
-				ensurePFIntegrity(s.Domains)
+				integrityErr = ensurePFIntegrity(s.Domains)
 			} else {
-				ensureHostsIntegrity(s.Domains)
+				integrityErr = ensureHostsIntegrity(s.Domains)
 			}
 
+			if integrityErr != nil {
+				consecutiveIntegrityFailures++
+				log.Printf("[daemon] CRITICAL: Integrity check failed (count: %d/%d): %v\n",
+					consecutiveIntegrityFailures, maxIntegrityFailures, integrityErr)
+
+				if consecutiveIntegrityFailures >= maxIntegrityFailures {
+					log.Printf("[daemon] FATAL: Cannot maintain block integrity after %d attempts.\n", maxIntegrityFailures)
+					log.Printf("[daemon] Possible causes: insufficient permissions, SIP restrictions, or system policy changes.\n")
+					log.Printf("[daemon] Exiting to prevent false sense of security.\n")
+					os.Exit(1)
+				}
+				return
+			}
+
+			// Reset counters on success
 			lastCheck = now
 			consecutiveErrors = 0
+			consecutiveIntegrityFailures = 0
 		}()
 	}
 }
@@ -367,19 +387,20 @@ func showStatus() {
 
 // --- Core Logic ---
 
-func ensureHostsIntegrity(domains []string) {
+func ensureHostsIntegrity(domains []string) error {
 	// Acquire lock while operating
 	content, err := os.ReadFile(HostsFile)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			_ = setImmutable(false)
 			if err := applyHostsBlock(domains); err != nil {
-				fmt.Printf("[ensureHostsIntegrity] failed applyHostsBlock: %v\n", err)
+				log.Printf("[ensureHostsIntegrity] failed applyHostsBlock: %v\n", err)
+				return err
 			}
-		} else {
-			fmt.Printf("[ensureHostsIntegrity] read hosts err: %v\n", err)
+			return nil
 		}
-		return
+		log.Printf("[ensureHostsIntegrity] read hosts err: %v\n", err)
+		return err
 	}
 	sContent := string(content)
 
@@ -387,24 +408,29 @@ func ensureHostsIntegrity(domains []string) {
 	if !strings.Contains(sContent, StartMarker) || !strings.Contains(sContent, EndMarker) {
 		_ = setImmutable(false)
 		if err := applyHostsBlock(domains); err != nil {
-			fmt.Printf("[ensureHostsIntegrity] failed applyHostsBlock: %v\n", err)
+			log.Printf("[ensureHostsIntegrity] failed applyHostsBlock: %v\n", err)
+			return err
 		}
-		return
+		return nil
 	}
 
 	// Ensure immutable flag is set (User cannot edit)
 	if !isImmutable() {
 		if err := setImmutable(true); err != nil {
-			fmt.Printf("[ensureHostsIntegrity] setImmutable err: %v. Will retry.\n", err)
-			return
+			log.Printf("[ensureHostsIntegrity] CRITICAL: Cannot set immutable flag: %v\n", err)
+			return fmt.Errorf("immutability enforcement failed: %w", err)
 		}
 	}
+
+	return nil
 }
 
-func ensurePFIntegrity(domains []string) {
+func ensurePFIntegrity(domains []string) error {
 	if err := applyPFBlock(domains); err != nil {
-		fmt.Printf("[ensurePFIntegrity] failed applyPFBlock: %v\n", err)
+		log.Printf("[ensurePFIntegrity] failed applyPFBlock: %v\n", err)
+		return err
 	}
+	return nil
 }
 
 func applyHostsBlock(domains []string) error {
