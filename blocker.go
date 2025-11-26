@@ -57,6 +57,7 @@ func main() {
 	cmdBlock := flag.NewFlagSet("block", flag.ExitOnError)
 	blockDuration := cmdBlock.Duration("duration", 0, "Duration to block (e.g., 1h, 30m)")
 	usePF := cmdBlock.Bool("pf", false, "Use PF firewall rules instead of /etc/hosts")
+	websitesFile := cmdBlock.String("file", "", "Path to file containing domains to block (e.g., ~/websites.txt)")
 
 	cmdDaemon := flag.NewFlagSet("daemon", flag.ExitOnError) // Internal use only
 
@@ -65,6 +66,21 @@ func main() {
 
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: sudo ./blocker <block|unblock|status> [args]")
+		fmt.Println("")
+		fmt.Println("Commands:")
+		fmt.Println("  block    Block specified domains for a duration")
+		fmt.Println("  unblock  Attempt to unblock (only works after duration expires)")
+		fmt.Println("  status   Show current block status")
+		fmt.Println("")
+		fmt.Println("Block Options:")
+		fmt.Println("  -duration  Duration to block (e.g., 1h, 30m, 2h30m)")
+		fmt.Println("  -file      Path to file containing domains (e.g., ~/websites.txt)")
+		fmt.Println("  -pf        Use PF firewall instead of /etc/hosts")
+		fmt.Println("")
+		fmt.Println("Examples:")
+		fmt.Println("  sudo ./blocker block -duration 1h facebook.com twitter.com")
+		fmt.Println("  sudo ./blocker block -duration 2h -file ~/websites.txt")
+		fmt.Println("  sudo ./blocker status")
 		os.Exit(1)
 	}
 
@@ -74,16 +90,35 @@ func main() {
 	case "block":
 		cmdBlock.Parse(os.Args[2:])
 		domains := cmdBlock.Args()
-		fileDomains, err := loadDomainsFromFile()
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			fmt.Printf("Warning: failed to read ~/websites.txt: %v\n", err)
-		} else {
+
+		// Load domains from specified file or default ~/websites.txt
+		var filePath string
+		if *websitesFile != "" {
+			filePath = expandTilde(*websitesFile)
+		}
+
+		fileDomains, loadedPath, err := loadDomainsFromFileWithPath(filePath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				if *websitesFile != "" {
+					// User explicitly specified a file that doesn't exist
+					fmt.Printf("Error: Specified file not found: %s\n", filePath)
+					os.Exit(1)
+				}
+				// Default file doesn't exist - that's ok, continue silently
+			} else {
+				fmt.Printf("Warning: failed to read %s: %v\n", loadedPath, err)
+			}
+		} else if len(fileDomains) > 0 {
+			fmt.Printf("📄 Loaded %d domains from %s\n", len(fileDomains), loadedPath)
 			domains = append(domains, fileDomains...)
 		}
+
 		domains = uniqueDomains(domains)
 		if len(domains) == 0 || *blockDuration <= 0 {
 			fmt.Println("Error: Must provide domains and valid duration.")
 			fmt.Println("Example: sudo ./blocker block -duration 30m facebook.com")
+			fmt.Println("         sudo ./blocker block -duration 1h -file ~/websites.txt")
 			os.Exit(1)
 		}
 		startBlock(domains, *blockDuration, *usePF)
@@ -221,7 +256,8 @@ func startBlock(domains []string, duration time.Duration, usePF bool) {
 		// not fatal; continue but warn
 	}
 
-	fmt.Printf("🔒 LOCKED. Blocked %d domains until %s.\n", len(domains), end.Format(time.Kitchen))
+	fmt.Printf("🔒 LOCKED. Blocked %d base domains (%d total with subdomains) until %s.\n",
+		len(domains), len(domains)*len(commonSubdomains)+len(domains), end.Format(time.Kitchen))
 	fmt.Println("⚠️  Emergency unblock is DISABLED by default. Use an emergency procedure if needed.")
 }
 
@@ -433,6 +469,31 @@ func ensurePFIntegrity(domains []string) error {
 	return nil
 }
 
+// Common subdomain prefixes to block
+var commonSubdomains = []string{
+	"www", "m", "mobile", "app", "api", "mail", "email",
+	"login", "auth", "accounts", "account", "signin", "signup",
+	"web", "cdn", "static", "assets", "media", "images", "img",
+	"video", "videos", "news", "blog", "help", "support",
+	"secure", "ssl", "pay", "payment", "checkout",
+	"connect", "link", "links", "go", "redirect",
+	"l", "t", "lm", "touch", "lite",
+	"about", "status", "business", "ads", "advertising",
+	"graph", "pixel", "track", "tracking", "analytics",
+	"edge", "gateway", "gw", "proxy",
+	"en", "us", "uk", "de", "fr", "es", "jp", "in",
+	"www2", "www3", "web2",
+}
+
+// expandDomainWithSubdomains generates all subdomain variations for blocking
+func expandDomainWithSubdomains(domain string) []string {
+	result := []string{domain}
+	for _, sub := range commonSubdomains {
+		result = append(result, sub+"."+domain)
+	}
+	return result
+}
+
 func applyHostsBlock(domains []string) error {
 	// Acquire lock
 	if err := setImmutable(false); err != nil {
@@ -465,13 +526,25 @@ func applyHostsBlock(domains []string) error {
 		sb.WriteString("\n")
 	}
 	sb.WriteString(StartMarker + "\n")
+
+	// Track already added domains to avoid duplicates
+	added := make(map[string]struct{})
+
 	for _, d := range domains {
-		sb.WriteString(fmt.Sprintf("127.0.0.1 %s\n", d))
-		sb.WriteString(fmt.Sprintf("127.0.0.1 www.%s\n", d))
-		sb.WriteString(fmt.Sprintf("0.0.0.0 %s\n", d))
-		sb.WriteString(fmt.Sprintf("0.0.0.0 www.%s\n", d))
-		sb.WriteString(fmt.Sprintf("::1 %s\n", d))
-		sb.WriteString(fmt.Sprintf("::1 www.%s\n", d))
+		// Expand domain with all common subdomains
+		expandedDomains := expandDomainWithSubdomains(d)
+
+		for _, expanded := range expandedDomains {
+			if _, exists := added[expanded]; exists {
+				continue
+			}
+			added[expanded] = struct{}{}
+
+			// Block on both IPv4 loopback addresses and IPv6
+			sb.WriteString(fmt.Sprintf("127.0.0.1 %s\n", expanded))
+			sb.WriteString(fmt.Sprintf("0.0.0.0 %s\n", expanded))
+			sb.WriteString(fmt.Sprintf("::1 %s\n", expanded))
+		}
 	}
 	sb.WriteString(EndMarker + "\n")
 
@@ -479,9 +552,8 @@ func applyHostsBlock(domains []string) error {
 		return err
 	}
 
-	// Flush DNS robustly
-	_ = exec.Command("dscacheutil", "-flushcache").Run()
-	_ = exec.Command("killall", "-HUP", "mDNSResponder").Run()
+	// Flush DNS robustly - multiple methods for macOS
+	flushDNSCache()
 
 	if err := setImmutable(true); err != nil {
 		fmt.Printf("[applyHostsBlock] failed to set immutable: %v\n", err)
@@ -489,6 +561,20 @@ func applyHostsBlock(domains []string) error {
 	}
 
 	return nil
+}
+
+// flushDNSCache performs comprehensive DNS cache flush on macOS
+func flushDNSCache() {
+	// macOS system DNS cache
+	_ = exec.Command("dscacheutil", "-flushcache").Run()
+	_ = exec.Command("killall", "-HUP", "mDNSResponder").Run()
+
+	// Additional macOS services that may cache DNS
+	_ = exec.Command("killall", "-HUP", "mDNSResponderHelper").Run()
+
+	// Some versions of macOS use different resolvers
+	_ = exec.Command("discoveryutil", "mdnsflushcache").Run()
+	_ = exec.Command("discoveryutil", "udnsflushcaches").Run()
 }
 
 func cleanupAndExit(s State) {
@@ -510,8 +596,9 @@ func cleanupAndExit(s State) {
 	content, _ := os.ReadFile(HostsFile)
 	clean := removeMarkerBlock(string(content))
 	_ = atomicWrite(HostsFile, []byte(clean), 0644)
-	_ = exec.Command("dscacheutil", "-flushcache").Run()
-	_ = exec.Command("killall", "-HUP", "mDNSResponder").Run()
+
+	// Flush DNS cache
+	flushDNSCache()
 
 	// Remove Persistence
 	_ = exec.Command("launchctl", "unload", "-w", PlistPath).Run()
@@ -590,20 +677,20 @@ func randInt64() int64 {
 
 func setImmutable(lock bool) error {
 	// Try schg first (stronger), fallback to uchg. Note: schg may fail on many systems.
-	flag := "schg"
+	chflag := "schg"
 	if !lock {
-		flag = "noschg"
+		chflag = "noschg"
 	}
-	if err := exec.Command("chflags", flag, HostsFile).Run(); err == nil {
+	if err := exec.Command("chflags", chflag, HostsFile).Run(); err == nil {
 		return nil
 	}
 
 	// fallback
-	flag2 := "uchg"
+	chflag2 := "uchg"
 	if !lock {
-		flag2 = "nouchg"
+		chflag2 = "nouchg"
 	}
-	if err := exec.Command("chflags", flag2, HostsFile).Run(); err != nil {
+	if err := exec.Command("chflags", chflag2, HostsFile).Run(); err != nil {
 		return fmt.Errorf("chflags failed (schg and uchg): %v", err)
 	}
 	return nil
@@ -833,19 +920,6 @@ func verifySig(data []byte, sig string) (bool, error) {
 
 // --- file lock ---
 
-func lockFileReadOnly(path string) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY, 0600)
-	if err != nil {
-		return nil, err
-	}
-	fd := f.Fd()
-	if err := syscall.Flock(int(fd), syscall.LOCK_SH); err != nil {
-		f.Close()
-		return nil, err
-	}
-	return f, nil
-}
-
 func lockFile(path string) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
@@ -868,29 +942,84 @@ func unlockFile(f *os.File) error {
 	return f.Close()
 }
 
-func loadDomainsFromFile() ([]string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
+// loadDomainsFromFileWithPath loads domains from specified path or default ~/websites.txt
+// Returns: domains, actual path used, error
+func loadDomainsFromFileWithPath(customPath string) ([]string, string, error) {
+	var path string
+
+	if customPath != "" {
+		// Use the custom path (already expanded)
+		path = customPath
+	} else {
+		// Use default ~/websites.txt
+		home := getRealUserHome()
+		if home == "" {
+			var err error
+			home, err = os.UserHomeDir()
+			if err != nil {
+				return nil, "", err
+			}
+		}
+		path = filepath.Join(home, "websites.txt")
 	}
-	path := filepath.Join(home, "websites.txt")
+
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, path, err
 	}
+
 	lines := strings.Split(string(b), "\n")
 	var domains []string
+	var invalidCount int
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 		if !isValidDomain(line) {
+			invalidCount++
+			fmt.Printf("  ⚠️  Skipping invalid domain: %s\n", line)
 			continue
 		}
 		domains = append(domains, line)
 	}
-	return domains, nil
+	if invalidCount > 0 {
+		fmt.Printf("  ⚠️  Skipped %d invalid domain(s)\n", invalidCount)
+	}
+	return domains, path, nil
+}
+
+// expandTilde expands ~ to the real user's home directory
+func expandTilde(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		home := getRealUserHome()
+		if home == "" {
+			home, _ = os.UserHomeDir()
+		}
+		if home != "" {
+			return filepath.Join(home, path[2:])
+		}
+	}
+	return path
+}
+
+// getRealUserHome returns the home directory of the user who invoked sudo
+func getRealUserHome() string {
+	// Try SUDO_USER first (set when running via sudo)
+	sudoUser := os.Getenv("SUDO_USER")
+	if sudoUser != "" && sudoUser != "root" {
+		// Look up the user's home directory
+		out, err := exec.Command("sh", "-c", fmt.Sprintf("eval echo ~%s", sudoUser)).Output()
+		if err == nil {
+			home := strings.TrimSpace(string(out))
+			if home != "" && home != "~"+sudoUser {
+				return home
+			}
+		}
+		// Fallback to /Users/<username> on macOS
+		return "/Users/" + sudoUser
+	}
+	return ""
 }
 
 func uniqueDomains(domains []string) []string {
@@ -959,23 +1088,37 @@ func applyPFBlock(domains []string) error {
 		return err
 	}
 	ipSet := make(map[string]struct{})
+
+	// Resolve IPs for each domain AND its common subdomains
 	for _, d := range domains {
-		addrs, err := net.LookupIP(d)
-		if err != nil {
-			return fmt.Errorf("dns lookup for %s: %w", d, err)
-		}
-		for _, ip := range addrs {
-			ipSet[ip.String()] = struct{}{}
+		expandedDomains := expandDomainWithSubdomains(d)
+
+		for _, expanded := range expandedDomains {
+			addrs, err := net.LookupIP(expanded)
+			if err != nil {
+				// Log but continue - subdomain might not exist
+				log.Printf("[applyPFBlock] dns lookup for %s failed (non-fatal): %v\n", expanded, err)
+				continue
+			}
+			for _, ip := range addrs {
+				ipSet[ip.String()] = struct{}{}
+			}
 		}
 	}
+
+	if len(ipSet) == 0 {
+		return fmt.Errorf("no IPs resolved for any domains")
+	}
+
 	var sb strings.Builder
-	// naive rules: block by rdr-to 127.0.0.1 is more complex; for demo, we add table and block by ip lookup
 	sb.WriteString("table <gob> persist {\n")
 	for ip := range ipSet {
 		sb.WriteString(ip + ",\n")
 	}
 	sb.WriteString("}\n")
+	// Block both TCP and UDP, and also block QUIC (UDP 443)
 	sb.WriteString("block out quick on any proto tcp from any to <gob> port {80, 443}\n")
+	sb.WriteString("block out quick on any proto udp from any to <gob> port {443}\n")
 	if err := atomicWrite(anchorPath, []byte(sb.String()), 0644); err != nil {
 		return err
 	}
