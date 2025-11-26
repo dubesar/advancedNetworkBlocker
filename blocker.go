@@ -28,9 +28,10 @@ const (
 	EndMarker            = "# GO_BLOCKER_END"
 	PlistLabel           = "com.user.goblocker"
 	PlistPath            = "/Library/LaunchDaemons/" + PlistLabel + ".plist"
-	StateFile            = "/var/run/goblocker_state.json"
+	StateDir             = "/var/lib/goblocker" // Persists across reboots (unlike /var/run)
+	StateFile            = StateDir + "/state.json"
 	StateSigFile         = StateFile + ".sig"
-	KeyFile              = "/var/lib/goblocker/key"
+	KeyFile              = StateDir + "/key"
 	CheckInterval        = 2 * time.Second
 	StateLockFile        = StateFile + ".lock"
 	ForwardJumpThreshold = 5 * time.Minute
@@ -39,6 +40,7 @@ const (
 	NewsyslogConfPath    = NewsyslogConfDir + "/goblocker.conf"
 	KeychainService      = "goblocker_state_signing"
 	KeychainAccount      = "goblocker"
+	MaxBlockDuration     = 30 * 24 * time.Hour // Maximum 30 days
 )
 
 // State persisted to disk (JSON). Signature is stored separately.
@@ -119,6 +121,10 @@ func main() {
 			fmt.Println("Error: Must provide domains and valid duration.")
 			fmt.Println("Example: sudo ./blocker block -duration 30m facebook.com")
 			fmt.Println("         sudo ./blocker block -duration 1h -file ~/websites.txt")
+			os.Exit(1)
+		}
+		if *blockDuration > MaxBlockDuration {
+			fmt.Printf("Error: Duration exceeds maximum allowed (%v).\n", MaxBlockDuration)
 			os.Exit(1)
 		}
 		startBlock(domains, *blockDuration, *usePF)
@@ -403,20 +409,39 @@ func showStatus() {
 		if err == nil && strings.Contains(string(out), PlistLabel) {
 			fmt.Println("⏰ Block expired. Automatic cleanup in progress...")
 		} else {
-			if _, err := os.Stat(HostsFile); err == nil {
-				content, _ := os.ReadFile(HostsFile)
-				if !strings.Contains(string(content), StartMarker) {
-					_ = removeStateFiles()
-					fmt.Println("No active block.")
-					return
+			// Check based on blocking mode
+			blockActive := false
+			if s.UsePF {
+				// Check if PF anchor has rules
+				out, err := exec.Command("pfctl", "-a", "goblocker", "-sr").Output()
+				blockActive = err == nil && len(strings.TrimSpace(string(out))) > 0
+			} else {
+				// Check hosts file
+				if _, err := os.Stat(HostsFile); err == nil {
+					content, _ := os.ReadFile(HostsFile)
+					blockActive = strings.Contains(string(content), StartMarker)
 				}
+			}
+
+			if !blockActive {
+				_ = removeStateFiles()
+				fmt.Println("No active block.")
+				return
 			}
 			fmt.Println("⚠️  Block expired but cleanup incomplete. Run: sudo ./blocker unblock")
 		}
 		return
 	}
+
+	// Show active block info
 	fmt.Println("🔒 Block is active.")
-	fmt.Printf("   Domains blocked: %d\n", len(s.Domains))
+	if s.UsePF {
+		fmt.Println("   Mode: PF Firewall")
+	} else {
+		fmt.Println("   Mode: /etc/hosts")
+	}
+	fmt.Printf("   Base domains: %d\n", len(s.Domains))
+	fmt.Printf("   Total entries: %d (with subdomains)\n", len(s.Domains)*(len(commonSubdomains)+1))
 	fmt.Printf("   Ends at: %s\n", end.Format(time.Kitchen))
 	fmt.Printf("⏳ Time remaining: %v\n", remaining.Round(time.Second))
 }
@@ -495,24 +520,24 @@ func expandDomainWithSubdomains(domain string) []string {
 }
 
 func applyHostsBlock(domains []string) error {
-	// Acquire lock
+	// Resolve symlinks to canonical path first
+	realPath, _ := filepath.EvalSymlinks(HostsFile)
+	if realPath == "" {
+		realPath = HostsFile
+	}
+
+	// Acquire lock on the actual file (after symlink resolution)
 	if err := setImmutable(false); err != nil {
 		// log but continue
 		fmt.Printf("[applyHostsBlock] failed to unset immutable: %v\n", err)
 		return err
 	}
 
-	f, err := lockFile(HostsFile)
+	f, err := lockFile(realPath)
 	if err != nil {
 		return err
 	}
 	defer unlockFile(f)
-
-	// Resolve symlinks to canonical path
-	realPath, _ := filepath.EvalSymlinks(HostsFile)
-	if realPath == "" {
-		realPath = HostsFile
-	}
 
 	content, err := os.ReadFile(realPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -762,11 +787,9 @@ func saveState(s State) error {
 	if err != nil {
 		return err
 	}
-	if err := ensureDir(filepath.Dir(KeyFile)); err != nil {
-		return err
-	}
-	if err := ensureDir(filepath.Dir(StateFile)); err != nil {
-		// best-effort
+	// Ensure state directory exists (persists across reboots)
+	if err := ensureDir(StateDir); err != nil {
+		return fmt.Errorf("failed to create state directory: %w", err)
 	}
 	if err := atomicWrite(StateFile, b, 0600); err != nil {
 		return err
@@ -934,6 +957,9 @@ func lockFile(path string) (*os.File, error) {
 }
 
 func unlockFile(f *os.File) error {
+	if f == nil {
+		return nil
+	}
 	fd := f.Fd()
 	if err := syscall.Flock(int(fd), syscall.LOCK_UN); err != nil {
 		f.Close()
@@ -1008,12 +1034,21 @@ func getRealUserHome() string {
 	// Try SUDO_USER first (set when running via sudo)
 	sudoUser := os.Getenv("SUDO_USER")
 	if sudoUser != "" && sudoUser != "root" {
-		// Look up the user's home directory
-		out, err := exec.Command("sh", "-c", fmt.Sprintf("eval echo ~%s", sudoUser)).Output()
+		// Sanitize username to prevent command injection
+		// Only allow alphanumeric, underscore, hyphen, and dot
+		for _, r := range sudoUser {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.') {
+				return "" // Invalid username, return empty
+			}
+		}
+
+		// Use dscl to safely get user's home directory (macOS specific)
+		out, err := exec.Command("dscl", ".", "-read", "/Users/"+sudoUser, "NFSHomeDirectory").Output()
 		if err == nil {
-			home := strings.TrimSpace(string(out))
-			if home != "" && home != "~"+sudoUser {
-				return home
+			// Output format: "NFSHomeDirectory: /Users/username"
+			parts := strings.SplitN(strings.TrimSpace(string(out)), ": ", 2)
+			if len(parts) == 2 && parts[1] != "" {
+				return parts[1]
 			}
 		}
 		// Fallback to /Users/<username> on macOS
@@ -1096,8 +1131,8 @@ func applyPFBlock(domains []string) error {
 		for _, expanded := range expandedDomains {
 			addrs, err := net.LookupIP(expanded)
 			if err != nil {
-				// Log but continue - subdomain might not exist
-				log.Printf("[applyPFBlock] dns lookup for %s failed (non-fatal): %v\n", expanded, err)
+				// Silently continue - subdomain might not exist
+				// Don't use log.Printf here as it may not be set up yet
 				continue
 			}
 			for _, ip := range addrs {
@@ -1122,6 +1157,10 @@ func applyPFBlock(domains []string) error {
 	if err := atomicWrite(anchorPath, []byte(sb.String()), 0644); err != nil {
 		return err
 	}
+
+	// Ensure anchor is referenced in main pf.conf for persistence
+	ensurePFAnchorRegistered()
+
 	// load anchor
 	if err := exec.Command("pfctl", "-a", "goblocker", "-f", anchorPath).Run(); err != nil {
 		return fmt.Errorf("pfctl load: %v", err)
@@ -1129,6 +1168,34 @@ func applyPFBlock(domains []string) error {
 	// enable pf if not already
 	_ = exec.Command("pfctl", "-e").Run()
 	return nil
+}
+
+// ensurePFAnchorRegistered ensures the goblocker anchor is in /etc/pf.conf
+func ensurePFAnchorRegistered() {
+	pfConf := "/etc/pf.conf"
+	anchorLine := "anchor \"goblocker\""
+	loadLine := "load anchor \"goblocker\" from \"/etc/pf.anchors/goblocker\""
+
+	content, err := os.ReadFile(pfConf)
+	if err != nil {
+		return // Can't read, skip
+	}
+
+	contentStr := string(content)
+	if strings.Contains(contentStr, anchorLine) {
+		return // Already registered
+	}
+
+	// Add anchor lines at the end
+	newContent := contentStr
+	if !strings.HasSuffix(newContent, "\n") {
+		newContent += "\n"
+	}
+	newContent += "\n# goblocker anchor\n"
+	newContent += anchorLine + "\n"
+	newContent += loadLine + "\n"
+
+	_ = atomicWrite(pfConf, []byte(newContent), 0644)
 }
 
 func cleanupPF(pfWasEnabled bool) error {
