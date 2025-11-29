@@ -43,15 +43,30 @@ const (
 	MaxBlockDuration     = 30 * 24 * time.Hour // Maximum 30 days
 )
 
+const (
+	pfctlPath         = "/sbin/pfctl"
+	chflagsPath       = "/usr/bin/chflags"
+	securityPath      = "/usr/bin/security"
+	dsclPath          = "/usr/bin/dscl"
+	killallPath       = "/usr/bin/killall"
+	dscacheutilPath   = "/usr/bin/dscacheutil"
+	discoveryutilPath = "/usr/sbin/discoveryutil"
+	launchctlPath     = "/bin/launchctl"
+	pgrepPath         = "/usr/bin/pgrep"
+	killPath          = "/bin/kill"
+	lsPath            = "/bin/ls"
+)
+
 // State persisted to disk (JSON). Signature is stored separately.
 type State struct {
-	StartUnix    int64    `json:"start_unix"`
-	DurationSec  int64    `json:"duration_sec"`
-	EndUnix      int64    `json:"end_unix"`
-	Domains      []string `json:"domains"`
-	IsActive     bool     `json:"is_active"`
-	UsePF        bool     `json:"use_pf"`
-	PFWasEnabled bool     `json:"pf_was_enabled"`
+	StartUnix         int64    `json:"start_unix"`
+	DurationSec       int64    `json:"duration_sec"`
+	EndUnix           int64    `json:"end_unix"`
+	Domains           []string `json:"domains"`
+	IsActive          bool     `json:"is_active"`
+	UsePF             bool     `json:"use_pf"`
+	PFWasEnabled      bool     `json:"pf_was_enabled"`
+	HostsWasImmutable bool     `json:"hosts_was_immutable"`
 }
 
 func main() {
@@ -147,7 +162,7 @@ func main() {
 }
 
 func isPFEnabled() bool {
-	out, err := exec.Command("pfctl", "-s", "info").Output()
+	out, err := exec.Command(pfctlPath, "-s", "info").Output()
 	if err != nil {
 		return false
 	}
@@ -174,14 +189,14 @@ func ensureLogRotation() {
 }
 
 func killExistingDaemons() {
-	_ = exec.Command("launchctl", "unload", "-w", PlistPath).Run()
+	_ = exec.Command(launchctlPath, "unload", "-w", PlistPath).Run()
 
-	out, _ := exec.Command("pgrep", "-f", "blocker daemon").Output()
+	out, _ := exec.Command(pgrepPath, "-f", "blocker daemon").Output()
 	pids := strings.Split(strings.TrimSpace(string(out)), "\n")
 
 	for _, pid := range pids {
 		if pid != "" && pid != fmt.Sprintf("%d", os.Getpid()) {
-			_ = exec.Command("kill", "-9", pid).Run()
+			_ = exec.Command(killPath, "-9", pid).Run()
 		}
 	}
 
@@ -191,6 +206,10 @@ func killExistingDaemons() {
 // --- High Level Commands ---
 
 func startBlock(domains []string, duration time.Duration, usePF bool) {
+	if err := ensureDir(StateDir); err != nil {
+		fmt.Printf("Failed to create state directory (%s): %v\n", StateDir, err)
+		os.Exit(1)
+	}
 	lf, err := lockFile(StateLockFile)
 	if err != nil {
 		fmt.Printf("Failed to acquire state lock: %v\n", err)
@@ -223,6 +242,7 @@ func startBlock(domains []string, duration time.Duration, usePF bool) {
 	if usePF {
 		pfWasEnabled = isPFEnabled()
 	}
+	hostsWasImmutable := currentImmutableFlags()
 
 	// Ensure key exists
 	if err := ensureKey(); err != nil {
@@ -233,7 +253,16 @@ func startBlock(domains []string, duration time.Duration, usePF bool) {
 	// 1. Save State
 	start := time.Now()
 	end := start.Add(duration)
-	s := State{StartUnix: start.Unix(), DurationSec: int64(duration.Seconds()), EndUnix: end.Unix(), Domains: domains, IsActive: true, UsePF: usePF, PFWasEnabled: pfWasEnabled}
+	s := State{
+		StartUnix:         start.Unix(),
+		DurationSec:       int64(duration.Seconds()),
+		EndUnix:           end.Unix(),
+		Domains:           domains,
+		IsActive:          true,
+		UsePF:             usePF,
+		PFWasEnabled:      pfWasEnabled,
+		HostsWasImmutable: hostsWasImmutable,
+	}
 	if err := saveState(s); err != nil {
 		fmt.Printf("Failed to save state: %v\n", err)
 		os.Exit(1)
@@ -405,7 +434,7 @@ func showStatus() {
 	end := time.Unix(s.EndUnix, 0)
 	remaining := time.Until(end)
 	if remaining <= 0 {
-		out, err := exec.Command("launchctl", "list").Output()
+		out, err := exec.Command(launchctlPath, "list").Output()
 		if err == nil && strings.Contains(string(out), PlistLabel) {
 			fmt.Println("⏰ Block expired. Automatic cleanup in progress...")
 		} else {
@@ -413,7 +442,7 @@ func showStatus() {
 			blockActive := false
 			if s.UsePF {
 				// Check if PF anchor has rules
-				out, err := exec.Command("pfctl", "-a", "goblocker", "-sr").Output()
+				out, err := exec.Command(pfctlPath, "-a", "goblocker", "-sr").Output()
 				blockActive = err == nil && len(strings.TrimSpace(string(out))) > 0
 			} else {
 				// Check hosts file
@@ -478,15 +507,25 @@ func ensureHostsIntegrity(domains []string) error {
 	// Ensure immutable flag is set (User cannot edit)
 	if !isImmutable() {
 		if err := setImmutable(true); err != nil {
-			log.Printf("[ensureHostsIntegrity] CRITICAL: Cannot set immutable flag: %v\n", err)
-			return fmt.Errorf("immutability enforcement failed: %w", err)
+			log.Printf("[ensureHostsIntegrity] WARN: Unable to set immutable flag: %v\n", err)
 		}
 	}
 
 	return nil
 }
 
+func pfRulesPresent() bool {
+	out, err := exec.Command(pfctlPath, "-a", "goblocker", "-sr").Output()
+	if err != nil {
+		return false
+	}
+	return len(strings.TrimSpace(string(out))) > 0
+}
+
 func ensurePFIntegrity(domains []string) error {
+	if pfRulesPresent() {
+		return nil
+	}
 	if err := applyPFBlock(domains); err != nil {
 		log.Printf("[ensurePFIntegrity] failed applyPFBlock: %v\n", err)
 		return err
@@ -582,7 +621,6 @@ func applyHostsBlock(domains []string) error {
 
 	if err := setImmutable(true); err != nil {
 		fmt.Printf("[applyHostsBlock] failed to set immutable: %v\n", err)
-		return err
 	}
 
 	return nil
@@ -591,15 +629,15 @@ func applyHostsBlock(domains []string) error {
 // flushDNSCache performs comprehensive DNS cache flush on macOS
 func flushDNSCache() {
 	// macOS system DNS cache
-	_ = exec.Command("dscacheutil", "-flushcache").Run()
-	_ = exec.Command("killall", "-HUP", "mDNSResponder").Run()
+	_ = exec.Command(dscacheutilPath, "-flushcache").Run()
+	_ = exec.Command(killallPath, "-HUP", "mDNSResponder").Run()
 
 	// Additional macOS services that may cache DNS
-	_ = exec.Command("killall", "-HUP", "mDNSResponderHelper").Run()
+	_ = exec.Command(killallPath, "-HUP", "mDNSResponderHelper").Run()
 
 	// Some versions of macOS use different resolvers
-	_ = exec.Command("discoveryutil", "mdnsflushcache").Run()
-	_ = exec.Command("discoveryutil", "udnsflushcaches").Run()
+	_ = exec.Command(discoveryutilPath, "mdnsflushcache").Run()
+	_ = exec.Command(discoveryutilPath, "udnsflushcaches").Run()
 }
 
 func cleanupAndExit(s State) {
@@ -608,6 +646,8 @@ func cleanupAndExit(s State) {
 	}
 
 	// Hosts cleanup
+	hostsWasImmutable := s.HostsWasImmutable
+
 	if err := setImmutable(false); err != nil {
 		fmt.Printf("[cleanupAndExit] failed to unset immutable: %v\n", err)
 		// non-fatal: log but continue cleanup
@@ -622,11 +662,17 @@ func cleanupAndExit(s State) {
 	clean := removeMarkerBlock(string(content))
 	_ = atomicWrite(HostsFile, []byte(clean), 0644)
 
+	if hostsWasImmutable {
+		if err := setImmutable(true); err != nil {
+			fmt.Printf("[cleanupAndExit] failed to restore immutable flag: %v\n", err)
+		}
+	}
+
 	// Flush DNS cache
 	flushDNSCache()
 
 	// Remove Persistence
-	_ = exec.Command("launchctl", "unload", "-w", PlistPath).Run()
+	_ = exec.Command(launchctlPath, "unload", "-w", PlistPath).Run()
 	_ = os.Remove(PlistPath)
 	_ = removeStateFiles()
 
@@ -706,7 +752,7 @@ func setImmutable(lock bool) error {
 	if !lock {
 		chflag = "noschg"
 	}
-	if err := exec.Command("chflags", chflag, HostsFile).Run(); err == nil {
+	if err := exec.Command(chflagsPath, chflag, HostsFile).Run(); err == nil {
 		return nil
 	}
 
@@ -715,18 +761,22 @@ func setImmutable(lock bool) error {
 	if !lock {
 		chflag2 = "nouchg"
 	}
-	if err := exec.Command("chflags", chflag2, HostsFile).Run(); err != nil {
+	if err := exec.Command(chflagsPath, chflag2, HostsFile).Run(); err != nil {
 		return fmt.Errorf("chflags failed (schg and uchg): %v", err)
 	}
 	return nil
 }
 
-func isImmutable() bool {
-	out, err := exec.Command("ls", "-lO", HostsFile).Output()
+func currentImmutableFlags() bool {
+	out, err := exec.Command(lsPath, "-lO", HostsFile).Output()
 	if err != nil {
 		return false
 	}
 	return strings.Contains(string(out), "uchg") || strings.Contains(string(out), "schg")
+}
+
+func isImmutable() bool {
+	return currentImmutableFlags()
 }
 
 func installPlist(exePath string) error {
@@ -768,12 +818,12 @@ func installPlist(exePath string) error {
 		return err
 	}
 
-	if err := exec.Command("launchctl", "load", "-w", PlistPath).Run(); err != nil {
+	if err := exec.Command(launchctlPath, "load", "-w", PlistPath).Run(); err != nil {
 		return fmt.Errorf("launchctl load failed: %v", err)
 	}
 
 	// verify
-	out, err := exec.Command("launchctl", "list").Output()
+	out, err := exec.Command(launchctlPath, "list").Output()
 	if err != nil || !strings.Contains(string(out), PlistLabel) {
 		return fmt.Errorf("plist not present in launchctl list")
 	}
@@ -891,7 +941,7 @@ func keyBytes() ([]byte, error) {
 
 func readKeyFromKeychain() ([]byte, error) {
 	out, err := exec.Command(
-		"security",
+		securityPath,
 		"find-generic-password",
 		"-s", KeychainService,
 		"-a", KeychainAccount,
@@ -910,7 +960,7 @@ func readKeyFromKeychain() ([]byte, error) {
 func writeKeyToKeychain(k []byte) error {
 	hexKey := hex.EncodeToString(k)
 	cmd := exec.Command(
-		"security",
+		securityPath,
 		"add-generic-password",
 		"-s", KeychainService,
 		"-a", KeychainAccount,
@@ -1043,7 +1093,7 @@ func getRealUserHome() string {
 		}
 
 		// Use dscl to safely get user's home directory (macOS specific)
-		out, err := exec.Command("dscl", ".", "-read", "/Users/"+sudoUser, "NFSHomeDirectory").Output()
+		out, err := exec.Command(dsclPath, ".", "-read", "/Users/"+sudoUser, "NFSHomeDirectory").Output()
 		if err == nil {
 			// Output format: "NFSHomeDirectory: /Users/username"
 			parts := strings.SplitN(strings.TrimSpace(string(out)), ": ", 2)
@@ -1162,11 +1212,11 @@ func applyPFBlock(domains []string) error {
 	ensurePFAnchorRegistered()
 
 	// load anchor
-	if err := exec.Command("pfctl", "-a", "goblocker", "-f", anchorPath).Run(); err != nil {
+	if err := exec.Command(pfctlPath, "-a", "goblocker", "-f", anchorPath).Run(); err != nil {
 		return fmt.Errorf("pfctl load: %v", err)
 	}
 	// enable pf if not already
-	_ = exec.Command("pfctl", "-e").Run()
+	_ = exec.Command(pfctlPath, "-e").Run()
 	return nil
 }
 
@@ -1199,11 +1249,18 @@ func ensurePFAnchorRegistered() {
 }
 
 func cleanupPF(pfWasEnabled bool) error {
-	anchorPath := "/etc/pf.anchors/goblocker"
-	_ = exec.Command("pfctl", "-a", "goblocker", "-F", "all").Run()
-	_ = os.Remove(anchorPath)
+	anchorDir := "/etc/pf.anchors"
+	anchorPath := filepath.Join(anchorDir, "goblocker")
+
+	// Clear rules from the running PF instance
+	_ = exec.Command(pfctlPath, "-a", "goblocker", "-F", "all").Run()
+
+	// Leave the anchor file in place but reset it to a harmless comment
+	_ = ensureDir(anchorDir)
+	_ = atomicWrite(anchorPath, []byte("# goblocker anchor cleared\n"), 0644)
+
 	if !pfWasEnabled {
-		_ = exec.Command("pfctl", "-d").Run()
+		_ = exec.Command(pfctlPath, "-d").Run()
 	}
 	return nil
 }
