@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -56,6 +57,25 @@ const (
 	killPath          = "/bin/kill"
 	lsPath            = "/bin/ls"
 )
+
+var (
+	hostsPathOnce      sync.Once
+	canonicalHostsPath string
+)
+
+// hostsPath returns the canonical path to the hosts file, resolved once.
+// Using the real path everywhere prevents symlink swaps on /etc/hosts.
+func hostsPath() string {
+	hostsPathOnce.Do(func() {
+		realPath, _ := filepath.EvalSymlinks(HostsFile)
+		if realPath == "" {
+			canonicalHostsPath = HostsFile
+			return
+		}
+		canonicalHostsPath = realPath
+	})
+	return canonicalHostsPath
+}
 
 // State persisted to disk (JSON). Signature is stored separately.
 type State struct {
@@ -446,8 +466,9 @@ func showStatus() {
 				blockActive = err == nil && len(strings.TrimSpace(string(out))) > 0
 			} else {
 				// Check hosts file
-				if _, err := os.Stat(HostsFile); err == nil {
-					content, _ := os.ReadFile(HostsFile)
+				hPath := hostsPath()
+				if _, err := os.Stat(hPath); err == nil {
+					content, _ := os.ReadFile(hPath)
 					blockActive = strings.Contains(string(content), StartMarker)
 				}
 			}
@@ -478,54 +499,14 @@ func showStatus() {
 // --- Core Logic ---
 
 func ensureHostsIntegrity(domains []string) error {
-	// Acquire lock while operating
-	content, err := os.ReadFile(HostsFile)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			_ = setImmutable(false)
-			if err := applyHostsBlock(domains); err != nil {
-				log.Printf("[ensureHostsIntegrity] failed applyHostsBlock: %v\n", err)
-				return err
-			}
-			return nil
-		}
-		log.Printf("[ensureHostsIntegrity] read hosts err: %v\n", err)
+	if err := applyHostsBlock(domains); err != nil {
+		log.Printf("[ensureHostsIntegrity] failed applyHostsBlock: %v\n", err)
 		return err
 	}
-	sContent := string(content)
-
-	// If our block is missing or corrupted
-	if !strings.Contains(sContent, StartMarker) || !strings.Contains(sContent, EndMarker) {
-		_ = setImmutable(false)
-		if err := applyHostsBlock(domains); err != nil {
-			log.Printf("[ensureHostsIntegrity] failed applyHostsBlock: %v\n", err)
-			return err
-		}
-		return nil
-	}
-
-	// Ensure immutable flag is set (User cannot edit)
-	if !isImmutable() {
-		if err := setImmutable(true); err != nil {
-			log.Printf("[ensureHostsIntegrity] WARN: Unable to set immutable flag: %v\n", err)
-		}
-	}
-
 	return nil
 }
 
-func pfRulesPresent() bool {
-	out, err := exec.Command(pfctlPath, "-a", "goblocker", "-sr").Output()
-	if err != nil {
-		return false
-	}
-	return len(strings.TrimSpace(string(out))) > 0
-}
-
 func ensurePFIntegrity(domains []string) error {
-	if pfRulesPresent() {
-		return nil
-	}
 	if err := applyPFBlock(domains); err != nil {
 		log.Printf("[ensurePFIntegrity] failed applyPFBlock: %v\n", err)
 		return err
@@ -559,11 +540,7 @@ func expandDomainWithSubdomains(domain string) []string {
 }
 
 func applyHostsBlock(domains []string) error {
-	// Resolve symlinks to canonical path first
-	realPath, _ := filepath.EvalSymlinks(HostsFile)
-	if realPath == "" {
-		realPath = HostsFile
-	}
+	realPath := hostsPath()
 
 	// Acquire lock on the actual file (after symlink resolution)
 	if err := setImmutable(false); err != nil {
@@ -653,14 +630,15 @@ func cleanupAndExit(s State) {
 		// non-fatal: log but continue cleanup
 	}
 
-	f, err := lockFile(HostsFile)
+	hPath := hostsPath()
+	f, err := lockFile(hPath)
 	if err == nil {
 		defer unlockFile(f)
 	}
 
-	content, _ := os.ReadFile(HostsFile)
+	content, _ := os.ReadFile(hPath)
 	clean := removeMarkerBlock(string(content))
-	_ = atomicWrite(HostsFile, []byte(clean), 0644)
+	_ = atomicWrite(hPath, []byte(clean), 0644)
 
 	if hostsWasImmutable {
 		if err := setImmutable(true); err != nil {
@@ -752,7 +730,7 @@ func setImmutable(lock bool) error {
 	if !lock {
 		chflag = "noschg"
 	}
-	if err := exec.Command(chflagsPath, chflag, HostsFile).Run(); err == nil {
+	if err := exec.Command(chflagsPath, chflag, hostsPath()).Run(); err == nil {
 		return nil
 	}
 
@@ -761,22 +739,18 @@ func setImmutable(lock bool) error {
 	if !lock {
 		chflag2 = "nouchg"
 	}
-	if err := exec.Command(chflagsPath, chflag2, HostsFile).Run(); err != nil {
+	if err := exec.Command(chflagsPath, chflag2, hostsPath()).Run(); err != nil {
 		return fmt.Errorf("chflags failed (schg and uchg): %v", err)
 	}
 	return nil
 }
 
 func currentImmutableFlags() bool {
-	out, err := exec.Command(lsPath, "-lO", HostsFile).Output()
+	out, err := exec.Command(lsPath, "-lO", hostsPath()).Output()
 	if err != nil {
 		return false
 	}
 	return strings.Contains(string(out), "uchg") || strings.Contains(string(out), "schg")
-}
-
-func isImmutable() bool {
-	return currentImmutableFlags()
 }
 
 func installPlist(exePath string) error {
@@ -865,8 +839,12 @@ func loadState() (State, error) {
 	if err != nil {
 		return s, fmt.Errorf("state sig missing: %w", err)
 	}
-	if ok, err := verifySig(b, string(sigb)); err != nil || !ok {
-		return s, fmt.Errorf("state signature invalid: %v", err)
+	ok, sigErr := verifySig(b, string(sigb))
+	if sigErr != nil {
+		return s, fmt.Errorf("verifySig error: %w", sigErr)
+	}
+	if !ok {
+		return s, fmt.Errorf("state signature invalid")
 	}
 	if err := json.Unmarshal(b, &s); err != nil {
 		return s, fmt.Errorf("unmarshal state: %w", err)
