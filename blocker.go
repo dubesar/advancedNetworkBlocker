@@ -96,6 +96,7 @@ type State struct {
 
 // Schedule represents a recurring daily block schedule (IST timezone)
 type Schedule struct {
+	ID            string   `json:"id"`              // Unique identifier for the schedule
 	StartTimeIST  string   `json:"start_time_ist"`  // Format: "HH:MM" in IST (e.g., "09:00")
 	EndTimeIST    string   `json:"end_time_ist"`    // Format: "HH:MM" in IST (e.g., "18:00")
 	Domains       []string `json:"domains"`         // Domains to block
@@ -126,6 +127,8 @@ func main() {
 	scheduleLockDays := cmdSchedule.Int("lock-days", 0, "Lock schedule for N days (0 = forever locked, cannot be removed)")
 
 	cmdScheduleStatus := flag.NewFlagSet("schedule-status", flag.ExitOnError)
+	cmdScheduleClear := flag.NewFlagSet("schedule-clear", flag.ExitOnError)
+	scheduleClearID := cmdScheduleClear.String("id", "", "Schedule ID to clear (omit to clear all)")
 
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: sudo ./blocker <command> [args]")
@@ -136,6 +139,7 @@ func main() {
 		fmt.Println("  status          Show current block status")
 		fmt.Println("  schedule        Set up a daily recurring block schedule (IST timezone)")
 		fmt.Println("  schedule-status Show current schedule status")
+		fmt.Println("  schedule-clear  Disable/remove schedule (only when outside its block window)")
 		fmt.Println("")
 		fmt.Println("Block Options:")
 		fmt.Println("  -duration  Duration to block (e.g., 1h, 30m, 2h30m)")
@@ -155,6 +159,7 @@ func main() {
 		fmt.Println("  sudo ./blocker schedule -start 09:00 -end 18:00 -file ~/websites.txt")
 		fmt.Println("  sudo ./blocker schedule -start 22:00 -end 06:00 -file ~/websites.txt  # Overnight block")
 		fmt.Println("  sudo ./blocker schedule-status")
+		fmt.Println("  sudo ./blocker schedule-clear")
 		fmt.Println("  sudo ./blocker status")
 		os.Exit(1)
 	}
@@ -165,45 +170,50 @@ func main() {
 	case "block":
 		cmdBlock.Parse(os.Args[2:])
 		domains := cmdBlock.Args()
-		if sched, err := loadSchedule(); err == nil && sched.IsActive {
-			isWithin, _, timeErr := isWithinSchedule(sched.StartTimeIST, sched.EndTimeIST)
-			if timeErr != nil {
-				fmt.Println("⛔ ACCESS DENIED. Failed to interpret active schedule.")
-				fmt.Println("   Use 'sudo ./blocker schedule-status' to inspect or recreate the schedule.")
-				os.Exit(1)
-			}
-
-			if isWithin {
-				fmt.Println("⛔ ACCESS DENIED. A scheduled block is currently active.")
-				fmt.Printf("   Schedule: %s - %s IST (daily)\n", sched.StartTimeIST, sched.EndTimeIST)
-				fmt.Println("   Manual blocks are only allowed outside the scheduled block window.")
-				fmt.Println("   Use 'sudo ./blocker schedule-status' to view schedule details.")
-				os.Exit(1)
-			}
-
+		if schedules, err := loadSchedules(); err == nil && len(schedules) > 0 {
 			nowIST := getCurrentTimeIST()
-			startHour, startMin, parseErr := parseTimeIST(sched.StartTimeIST)
-			if parseErr != nil {
-				fmt.Println("⛔ ACCESS DENIED. Failed to interpret active schedule start time.")
-				fmt.Println("   Use 'sudo ./blocker schedule-status' to inspect or recreate the schedule.")
-				os.Exit(1)
-			}
-			nextBlock := time.Date(nowIST.Year(), nowIST.Month(), nowIST.Day(),
-				startHour, startMin, 0, 0, getISTLocation())
-			if nextBlock.Before(nowIST) {
-				nextBlock = nextBlock.Add(24 * time.Hour)
+			earliestNext := time.Time{}
+
+			for _, sched := range schedules {
+				if !sched.IsActive {
+					continue
+				}
+				isWithin, _, timeErr := isWithinSchedule(sched.StartTimeIST, sched.EndTimeIST)
+				if timeErr != nil {
+					fmt.Println("⛔ ACCESS DENIED. Failed to interpret an active schedule.")
+					fmt.Println("   Use 'sudo ./blocker schedule-status' to inspect or recreate schedules.")
+					os.Exit(1)
+				}
+				if isWithin {
+					fmt.Println("⛔ ACCESS DENIED. A scheduled block is currently active.")
+					fmt.Printf("   Schedule ID: %s, Window: %s - %s IST (daily)\n", sched.ID, sched.StartTimeIST, sched.EndTimeIST)
+					fmt.Println("   Manual blocks are only allowed outside all scheduled windows.")
+					fmt.Println("   Use 'sudo ./blocker schedule-status' to view schedule details.")
+					os.Exit(1)
+				}
+
+				nextStart, parseErr := nextScheduleStart(sched.StartTimeIST, nowIST)
+				if parseErr != nil {
+					fmt.Println("⛔ ACCESS DENIED. Failed to interpret schedule start time.")
+					os.Exit(1)
+				}
+				if earliestNext.IsZero() || nextStart.Before(earliestNext) {
+					earliestNext = nextStart
+				}
 			}
 
-			manualEndIST := time.Now().Add(*blockDuration).In(getISTLocation())
-			if !manualEndIST.Before(nextBlock) {
-				fmt.Println("⛔ ACCESS DENIED. This manual block would overlap the next scheduled block.")
-				fmt.Printf("   Schedule: %s - %s IST (daily)\n", sched.StartTimeIST, sched.EndTimeIST)
-				maxDur := time.Until(nextBlock)
-				if maxDur > 0 {
-					fmt.Printf("   You can block manually for up to %v from now without overlapping the schedule.\n", maxDur.Round(time.Minute))
+			if !earliestNext.IsZero() {
+				manualEndIST := time.Now().Add(*blockDuration).In(getISTLocation())
+				if !manualEndIST.Before(earliestNext) {
+					fmt.Println("⛔ ACCESS DENIED. This manual block would overlap the next scheduled block.")
+					fmt.Printf("   Next schedule starts at: %s IST\n", earliestNext.Format("15:04"))
+					maxDur := time.Until(earliestNext)
+					if maxDur > 0 {
+						fmt.Printf("   You can block manually for up to %v from now without overlapping the schedule.\n", maxDur.Round(time.Minute))
+					}
+					fmt.Println("   Use 'sudo ./blocker schedule-status' to view schedule details.")
+					os.Exit(1)
 				}
-				fmt.Println("   Use 'sudo ./blocker schedule-status' to view schedule details.")
-				os.Exit(1)
 			}
 		}
 
@@ -293,6 +303,10 @@ func main() {
 	case "schedule-status":
 		cmdScheduleStatus.Parse(os.Args[2:])
 		showScheduleStatus()
+
+	case "schedule-clear":
+		cmdScheduleClear.Parse(os.Args[2:])
+		clearSchedule(*scheduleClearID)
 
 	default:
 		fmt.Println("Unknown command")
@@ -470,27 +484,53 @@ func runDaemon() {
 				}
 			}()
 
-			// Check for active schedule and manage scheduled blocking
-			schedule, schedErr := loadSchedule()
-			if schedErr == nil && schedule.IsActive {
-				isWithin, remaining, err := isWithinSchedule(schedule.StartTimeIST, schedule.EndTimeIST)
-				if err == nil {
+			// Check for active schedules and manage scheduled blocking
+			schedules, schedErr := loadSchedules()
+			var (
+				activeDomains []string
+				activeUsePF   bool
+				maxRemaining  time.Duration
+				anySchedule   bool
+				anyActive     bool
+			)
+
+			if schedErr == nil && len(schedules) > 0 {
+				anySchedule = true
+				for _, sched := range schedules {
+					if !sched.IsActive {
+						continue
+					}
+					isWithin, remaining, err := isWithinSchedule(sched.StartTimeIST, sched.EndTimeIST)
+					if err != nil {
+						continue
+					}
 					if isWithin {
-						// We should be blocking - check if block is active
-						s, stateErr := loadState()
-						if stateErr != nil || !s.IsActive || time.Now().Unix() >= s.EndUnix {
-							// Need to start or restart the block
-							log.Printf("[daemon] Schedule active, starting/restarting block for %v\n", remaining)
-							startScheduledBlock(schedule, remaining)
+						anyActive = true
+						activeDomains = append(activeDomains, sched.Domains...)
+						if remaining > maxRemaining {
+							maxRemaining = remaining
 						}
-					} else {
-						// Outside schedule window - if there's an active schedule-based block, clean it up
-						s, stateErr := loadState()
-						if stateErr == nil && s.IsActive && s.FromSchedule {
-							log.Printf("[daemon] Outside schedule window, cleaning up schedule-based block\n")
-							cleanupScheduledBlock(s)
+						if sched.UsePF {
+							activeUsePF = true
 						}
 					}
+				}
+			}
+
+			if anyActive {
+				activeDomains = uniqueDomains(activeDomains)
+				s, stateErr := loadState()
+				needStart := stateErr != nil || !s.IsActive || time.Now().Unix() >= s.EndUnix || !s.FromSchedule || s.UsePF != activeUsePF || !equalStringSets(uniqueDomains(s.Domains), activeDomains)
+				if needStart {
+					log.Printf("[daemon] Schedule active, enforcing union of %d domains for %v\n", len(activeDomains), maxRemaining)
+					startScheduledBlockUnion(activeDomains, activeUsePF, maxRemaining)
+				}
+			} else {
+				// Outside all schedule windows - if there's an active schedule-based block, clean it up
+				s, stateErr := loadState()
+				if stateErr == nil && s.IsActive && s.FromSchedule {
+					log.Printf("[daemon] Outside schedule window, cleaning up schedule-based block\n")
+					cleanupScheduledBlock(s)
 				}
 			}
 
@@ -498,7 +538,7 @@ func runDaemon() {
 			if err != nil {
 				// If state unavailable or signature invalid, check if schedule is active
 				// If schedule exists, we might just be between block periods
-				if schedErr == nil && schedule.IsActive {
+				if schedErr == nil && anySchedule {
 					consecutiveErrors = 0 // Reset - schedule mode is active
 					return
 				}
@@ -535,7 +575,7 @@ func runDaemon() {
 					cleanupScheduledBlock(s)
 					return
 				} else {
-					if schedErr == nil && schedule.IsActive {
+					if schedErr == nil && anySchedule {
 						cleanupScheduledBlock(s)
 						return
 					} else {
@@ -615,21 +655,19 @@ func cleanupScheduledBlock(s State) {
 }
 
 func attemptUnblock() {
-	// Check if schedule is active - deny unblock if so
-	if sched, err := loadSchedule(); err == nil && sched.IsActive {
-		// Check if schedule is locked
-		if sched.LockUntilUnix == 0 || time.Now().Unix() < sched.LockUntilUnix {
-			fmt.Println("⛔ ACCESS DENIED. A schedule is active and LOCKED.")
-			fmt.Println("   You cannot manually unblock while a schedule is in effect.")
-			fmt.Println("   The schedule will automatically manage blocking based on time.")
-			fmt.Printf("   Schedule: %s - %s IST (daily)\n", sched.StartTimeIST, sched.EndTimeIST)
-			if sched.LockUntilUnix == 0 {
-				fmt.Println("   🔒 Lock: PERMANENT")
-			} else {
-				lockEnd := time.Unix(sched.LockUntilUnix, 0).In(getISTLocation())
-				fmt.Printf("   🔒 Lock expires: %s IST\n", lockEnd.Format("2006-01-02 15:04"))
+	// Check if any schedule window is currently active - deny unblock if so
+	if schedules, err := loadSchedules(); err == nil {
+		for _, sched := range schedules {
+			if !sched.IsActive {
+				continue
 			}
-			os.Exit(1)
+			isWithin, _, err := isWithinSchedule(sched.StartTimeIST, sched.EndTimeIST)
+			if err == nil && isWithin {
+				fmt.Println("⛔ ACCESS DENIED. A schedule is active.")
+				fmt.Println("   Manual unblock is disabled while any schedule window is in effect.")
+				fmt.Printf("   Active schedule ID: %s (%s - %s IST)\n", sched.ID, sched.StartTimeIST, sched.EndTimeIST)
+				os.Exit(1)
+			}
 		}
 	}
 
@@ -716,17 +754,18 @@ func showStatus() {
 	}
 
 	// Show schedule info if exists
-	if sched, err := loadSchedule(); err == nil && sched.IsActive {
-		fmt.Println("\n📅 Active Schedule:")
-		fmt.Printf("   Block window: %s - %s IST (daily)\n", sched.StartTimeIST, sched.EndTimeIST)
-		if sched.LockUntilUnix == 0 {
-			fmt.Println("   🔒 Lock: PERMANENT")
-		} else {
-			lockEnd := time.Unix(sched.LockUntilUnix, 0).In(getISTLocation())
-			lockRemaining := time.Until(time.Unix(sched.LockUntilUnix, 0))
-			if lockRemaining > 0 {
-				fmt.Printf("   🔒 Lock expires: %s IST\n", lockEnd.Format("2006-01-02 15:04"))
+	if schedules, err := loadSchedules(); err == nil && len(schedules) > 0 {
+		fmt.Println("\n📅 Active Schedules:")
+		for _, sched := range schedules {
+			status := "inactive"
+			if sched.IsActive {
+				if within, _, _ := isWithinSchedule(sched.StartTimeIST, sched.EndTimeIST); within {
+					status = "blocking now"
+				} else {
+					status = "waiting"
+				}
 			}
+			fmt.Printf("   ID %s: %s - %s IST (%s)\n", sched.ID, sched.StartTimeIST, sched.EndTimeIST, status)
 		}
 	}
 }
@@ -805,6 +844,39 @@ func isWithinSchedule(startTimeIST, endTimeIST string) (bool, time.Duration, err
 	return isWithin, time.Duration(remainingMinutes) * time.Minute, nil
 }
 
+// nextScheduleStart returns the next start time (IST) for a daily schedule relative to nowIST.
+func nextScheduleStart(startTimeIST string, nowIST time.Time) (time.Time, error) {
+	startHour, startMin, err := parseTimeIST(startTimeIST)
+	if err != nil {
+		return time.Time{}, err
+	}
+	next := time.Date(nowIST.Year(), nowIST.Month(), nowIST.Day(), startHour, startMin, 0, 0, getISTLocation())
+	if next.Before(nowIST) || next.Equal(nowIST) {
+		next = next.Add(24 * time.Hour)
+	}
+	return next, nil
+}
+
+func equalStringSets(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	m := make(map[string]int, len(a))
+	for _, v := range a {
+		m[v]++
+	}
+	for _, v := range b {
+		if m[v] == 0 {
+			return false
+		}
+		m[v]--
+		if m[v] == 0 {
+			delete(m, v)
+		}
+	}
+	return len(m) == 0
+}
+
 // setSchedule creates a new daily recurring schedule
 func setSchedule(startTimeIST, endTimeIST string, domains []string, usePF bool, lockDays int) {
 	// Validate time formats
@@ -830,24 +902,6 @@ func setSchedule(startTimeIST, endTimeIST string, domains []string, usePF bool, 
 		os.Exit(1)
 	}
 
-	// Check if a schedule already exists and is locked
-	existingSchedule, err := loadSchedule()
-	if err == nil && existingSchedule.IsActive {
-		if existingSchedule.LockUntilUnix == 0 {
-			fmt.Println("⛔ ACCESS DENIED. An existing schedule is PERMANENTLY LOCKED.")
-			fmt.Println("   The schedule cannot be modified or removed.")
-			fmt.Println("   Use 'sudo ./blocker schedule-status' to view details.")
-			os.Exit(1)
-		}
-		if time.Now().Unix() < existingSchedule.LockUntilUnix {
-			lockEnd := time.Unix(existingSchedule.LockUntilUnix, 0).In(getISTLocation())
-			fmt.Println("⛔ ACCESS DENIED. An existing schedule is LOCKED.")
-			fmt.Printf("   Lock expires: %s IST\n", lockEnd.Format("2006-01-02 15:04"))
-			fmt.Println("   Use 'sudo ./blocker schedule-status' to view details.")
-			os.Exit(1)
-		}
-	}
-
 	// Ensure key exists
 	if err := ensureKey(); err != nil {
 		fmt.Printf("Failed to ensure key: %v\n", err)
@@ -863,6 +917,7 @@ func setSchedule(startTimeIST, endTimeIST string, domains []string, usePF bool, 
 	}
 
 	schedule := Schedule{
+		ID:            newScheduleID(),
 		StartTimeIST:  startTimeIST,
 		EndTimeIST:    endTimeIST,
 		Domains:       domains,
@@ -872,7 +927,10 @@ func setSchedule(startTimeIST, endTimeIST string, domains []string, usePF bool, 
 		LockUntilUnix: lockUntilUnix,
 	}
 
-	if err := saveSchedule(schedule); err != nil {
+	existingSchedules, _ := loadSchedules()
+	existingSchedules = append(existingSchedules, schedule)
+
+	if err := saveSchedules(existingSchedules); err != nil {
 		fmt.Printf("Failed to save schedule: %v\n", err)
 		os.Exit(1)
 	}
@@ -884,6 +942,7 @@ func setSchedule(startTimeIST, endTimeIST string, domains []string, usePF bool, 
 	}
 
 	fmt.Println("📅 SCHEDULE SET (IST Timezone)")
+	fmt.Printf("   ID: %s\n", schedule.ID)
 	fmt.Printf("   Block time: %s - %s IST\n", startTimeIST, endTimeIST)
 	fmt.Printf("   Domains: %d base domains (%d total with subdomains)\n",
 		len(domains), len(domains)*(len(commonSubdomains)+1))
@@ -987,71 +1046,154 @@ func startScheduledBlock(schedule Schedule, duration time.Duration) {
 		end.In(getISTLocation()).Format("15:04"))
 }
 
+// startScheduledBlockUnion starts a block based on aggregated schedules (domains/usePF/remaining)
+func startScheduledBlockUnion(domains []string, usePF bool, duration time.Duration) {
+	// Reuse startScheduledBlock by creating a synthetic schedule
+	sched := Schedule{
+		Domains:  domains,
+		UsePF:    usePF,
+		IsActive: true,
+	}
+	startScheduledBlock(sched, duration)
+}
+
 // showScheduleStatus displays the current schedule status
 func showScheduleStatus() {
-	schedule, err := loadSchedule()
-	if err != nil {
+	schedules, err := loadSchedules()
+	if err != nil || len(schedules) == 0 {
 		fmt.Println("No schedule is set.")
-		return
-	}
-
-	if !schedule.IsActive {
-		fmt.Println("No active schedule.")
 		return
 	}
 
 	nowIST := getCurrentTimeIST()
 	fmt.Println("📅 SCHEDULE STATUS (IST Timezone)")
 	fmt.Printf("   Current time: %s IST\n", nowIST.Format("15:04"))
-	fmt.Printf("   Block window: %s - %s IST (daily)\n", schedule.StartTimeIST, schedule.EndTimeIST)
-	fmt.Printf("   Domains: %d base domains (%d total with subdomains)\n",
-		len(schedule.Domains), len(schedule.Domains)*(len(commonSubdomains)+1))
 
-	if schedule.UsePF {
-		fmt.Println("   Mode: PF Firewall")
-	} else {
-		fmt.Println("   Mode: /etc/hosts")
-	}
-
-	createdAt := time.Unix(schedule.CreatedAtUnix, 0).In(getISTLocation())
-	fmt.Printf("   Created: %s IST\n", createdAt.Format("2006-01-02 15:04"))
-
-	if schedule.LockUntilUnix == 0 {
-		fmt.Println("   🔒 Lock: PERMANENT (cannot be removed)")
-	} else {
-		lockEnd := time.Unix(schedule.LockUntilUnix, 0).In(getISTLocation())
-		remaining := time.Until(time.Unix(schedule.LockUntilUnix, 0))
-		if remaining > 0 {
-			fmt.Printf("   🔒 Lock expires: %s IST (in %v)\n",
-				lockEnd.Format("2006-01-02 15:04"), remaining.Round(time.Minute))
+	activeAny := false
+	for _, schedule := range schedules {
+		fmt.Println("\n---")
+		fmt.Printf("ID: %s\n", schedule.ID)
+		fmt.Printf("   Block window: %s - %s IST (daily)\n", schedule.StartTimeIST, schedule.EndTimeIST)
+		fmt.Printf("   Domains: %d base domains (%d total with subdomains)\n",
+			len(schedule.Domains), len(schedule.Domains)*(len(commonSubdomains)+1))
+		if schedule.UsePF {
+			fmt.Println("   Mode: PF Firewall")
 		} else {
-			fmt.Println("   🔓 Lock: Expired (schedule can be modified)")
+			fmt.Println("   Mode: /etc/hosts")
+		}
+		createdAt := time.Unix(schedule.CreatedAtUnix, 0).In(getISTLocation())
+		fmt.Printf("   Created: %s IST\n", createdAt.Format("2006-01-02 15:04"))
+
+		isWithin, remaining, _ := isWithinSchedule(schedule.StartTimeIST, schedule.EndTimeIST)
+		if isWithin {
+			activeAny = true
+			fmt.Println("   🔒 STATUS: BLOCKING ACTIVE")
+			fmt.Printf("   Time remaining in this session: %v\n", remaining.Round(time.Minute))
+		} else {
+			// Calculate time until next block
+			startHour, startMin, _ := parseTimeIST(schedule.StartTimeIST)
+			nextBlock := time.Date(nowIST.Year(), nowIST.Month(), nowIST.Day(),
+				startHour, startMin, 0, 0, getISTLocation())
+			if nextBlock.Before(nowIST) {
+				nextBlock = nextBlock.Add(24 * time.Hour)
+			}
+			fmt.Println("   🟢 STATUS: Outside scheduled block time")
+			fmt.Printf("   Next block starts: %s IST (in %v)\n",
+				nextBlock.Format("15:04"), time.Until(nextBlock).Round(time.Minute))
+		}
+		if schedule.LockUntilUnix == 0 {
+			fmt.Println("   🔒 Lock: PERMANENT (info only)")
+		} else {
+			lockEnd := time.Unix(schedule.LockUntilUnix, 0).In(getISTLocation())
+			remaining := time.Until(time.Unix(schedule.LockUntilUnix, 0))
+			if remaining > 0 {
+				fmt.Printf("   🔒 Lock set until: %s IST (in %v)\n",
+					lockEnd.Format("2006-01-02 15:04"), remaining.Round(time.Minute))
+			} else {
+				fmt.Println("   🔓 Lock: Expired")
+			}
 		}
 	}
 
-	isWithin, remaining, _ := isWithinSchedule(schedule.StartTimeIST, schedule.EndTimeIST)
-	if isWithin {
-		fmt.Println("\n🔒 STATUS: BLOCKING ACTIVE")
-		fmt.Printf("   Time remaining in this session: %v\n", remaining.Round(time.Minute))
-	} else {
-		fmt.Println("\n🟢 STATUS: Outside scheduled block time")
-		// Calculate time until next block
-		startHour, startMin, _ := parseTimeIST(schedule.StartTimeIST)
-		nextBlock := time.Date(nowIST.Year(), nowIST.Month(), nowIST.Day(),
-			startHour, startMin, 0, 0, getISTLocation())
-		if nextBlock.Before(nowIST) {
-			nextBlock = nextBlock.Add(24 * time.Hour)
-		}
-		fmt.Printf("   Next block starts: %s IST (in %v)\n",
-			nextBlock.Format("15:04"), time.Until(nextBlock).Round(time.Minute))
+	if activeAny {
+		fmt.Println("\nNote: schedule-clear is allowed only when the target schedule is outside its window.")
 	}
-
-	fmt.Println("\n⚠️  Schedule CANNOT be modified or removed while locked!")
 }
 
-// saveSchedule saves the schedule to disk with signature
-func saveSchedule(schedule Schedule) error {
-	b, err := json.Marshal(schedule)
+// clearSchedule disables/removes schedules (only allowed outside their window). If id is empty, clears all eligible.
+func clearSchedule(id string) {
+	schedules, err := loadSchedules()
+	if err != nil || len(schedules) == 0 {
+		fmt.Println("No schedule is set.")
+		return
+	}
+
+	nowIST := getCurrentTimeIST()
+
+	var kept []Schedule
+	removed := 0
+	deniedActive := 0
+
+	for _, sched := range schedules {
+		if id != "" && sched.ID != id {
+			kept = append(kept, sched)
+			continue
+		}
+
+		isWithin, _, timeErr := isWithinSchedule(sched.StartTimeIST, sched.EndTimeIST)
+		if timeErr != nil {
+			fmt.Printf("Error evaluating schedule %s: %v\n", sched.ID, timeErr)
+			os.Exit(1)
+		}
+		if isWithin {
+			deniedActive++
+			kept = append(kept, sched)
+			continue
+		}
+
+		// ignore lock for removal per request
+		removed++
+	}
+
+	if removed == 0 && deniedActive == 0 {
+		if id == "" {
+			fmt.Println("No schedules removed.")
+		} else {
+			fmt.Printf("No schedule found with id %s.\n", id)
+		}
+		return
+	}
+	if deniedActive > 0 {
+		fmt.Printf("⛔ %d schedule(s) currently inside their block window (IST %s). Clear is only allowed outside.\n", deniedActive, nowIST.Format("15:04"))
+	}
+
+	if err := saveSchedules(kept); err != nil {
+		fmt.Printf("Failed to update schedules: %v\n", err)
+		os.Exit(1)
+	}
+	if len(kept) == 0 {
+		_ = os.Remove(ScheduleFile)
+		_ = os.Remove(ScheduleSigFile)
+	}
+
+	// Clean up any schedule-based block if no active schedules remain
+	if len(kept) == 0 {
+		if state, stErr := loadState(); stErr == nil && state.IsActive && state.FromSchedule {
+			cleanupScheduledBlock(state)
+		}
+	}
+
+	fmt.Printf("✅ Removed %d schedule(s).\n", removed)
+}
+
+type scheduleStore struct {
+	Schedules []Schedule `json:"schedules"`
+}
+
+// saveSchedules saves all schedules to disk with signature
+func saveSchedules(schedules []Schedule) error {
+	store := scheduleStore{Schedules: schedules}
+	b, err := json.Marshal(store)
 	if err != nil {
 		return err
 	}
@@ -1071,28 +1213,38 @@ func saveSchedule(schedule Schedule) error {
 	return nil
 }
 
-// loadSchedule loads the schedule from disk and verifies signature
-func loadSchedule() (Schedule, error) {
-	var s Schedule
+// loadSchedules loads all schedules from disk and verifies signature.
+// Backward compatible: if the file contains a single Schedule object, it will be wrapped.
+func loadSchedules() ([]Schedule, error) {
+	var store scheduleStore
 	b, err := os.ReadFile(ScheduleFile)
 	if err != nil {
-		return s, fmt.Errorf("schedule file read: %w", err)
+		return nil, fmt.Errorf("schedule file read: %w", err)
 	}
 	sigb, err := os.ReadFile(ScheduleSigFile)
 	if err != nil {
-		return s, fmt.Errorf("schedule sig missing: %w", err)
+		return nil, fmt.Errorf("schedule sig missing: %w", err)
 	}
 	ok, sigErr := verifySig(b, string(sigb))
 	if sigErr != nil {
-		return s, fmt.Errorf("verifySig error: %w", sigErr)
+		return nil, fmt.Errorf("verifySig error: %w", sigErr)
 	}
 	if !ok {
-		return s, fmt.Errorf("schedule signature invalid")
+		return nil, fmt.Errorf("schedule signature invalid")
 	}
-	if err := json.Unmarshal(b, &s); err != nil {
-		return s, fmt.Errorf("unmarshal schedule: %w", err)
+
+	// First try store format
+	if err := json.Unmarshal(b, &store); err == nil && len(store.Schedules) > 0 {
+		return store.Schedules, nil
 	}
-	return s, nil
+
+	// Fallback to legacy single-schedule format
+	var single Schedule
+	if err := json.Unmarshal(b, &single); err == nil && single.StartTimeIST != "" {
+		return []Schedule{single}, nil
+	}
+
+	return nil, fmt.Errorf("no schedules found")
 }
 
 // --- Core Logic ---
@@ -1321,6 +1473,15 @@ func atomicWrite(path string, data []byte, perm os.FileMode) error {
 func randInt64() int64 {
 	n, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
 	return n.Int64()
+}
+
+func newScheduleID() string {
+	// 6 random bytes => 12 hex chars, sufficient uniqueness for CLI use
+	buf := make([]byte, 6)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(buf)
 }
 
 func setImmutable(lock bool) error {
