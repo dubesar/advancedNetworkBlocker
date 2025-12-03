@@ -844,6 +844,58 @@ func isWithinSchedule(startTimeIST, endTimeIST string) (bool, time.Duration, err
 	return isWithin, time.Duration(remainingMinutes) * time.Minute, nil
 }
 
+// scheduleIntervals converts a daily schedule window into one or two half-open intervals expressed in minutes since 00:00 IST.
+// Overnight windows are represented as two intervals (e.g., 22:00-06:00 => [1320,1440) and [0,360)).
+// If start equals end, treat as a full-day block which overlaps everything else.
+func scheduleIntervals(startTimeIST, endTimeIST string) ([][2]int, error) {
+	startHour, startMin, err := parseTimeIST(startTimeIST)
+	if err != nil {
+		return nil, err
+	}
+	endHour, endMin, err := parseTimeIST(endTimeIST)
+	if err != nil {
+		return nil, err
+	}
+
+	startMinutes := startHour*60 + startMin
+	endMinutes := endHour*60 + endMin
+
+	if startMinutes == endMinutes {
+		return [][2]int{{0, 24 * 60}}, nil
+	}
+
+	if startMinutes < endMinutes {
+		return [][2]int{{startMinutes, endMinutes}}, nil
+	}
+
+	return [][2]int{{startMinutes, 24 * 60}, {0, endMinutes}}, nil
+}
+
+// schedulesOverlap reports whether two daily schedules share any active minutes (inclusive start, exclusive end).
+// Touching at endpoints (e.g., 12:00-13:00 and 13:00-14:00) is allowed.
+func schedulesOverlap(aStart, aEnd, bStart, bEnd string) (bool, error) {
+	aIntervals, err := scheduleIntervals(aStart, aEnd)
+	if err != nil {
+		return false, err
+	}
+	bIntervals, err := scheduleIntervals(bStart, bEnd)
+	if err != nil {
+		return false, err
+	}
+
+	for _, ai := range aIntervals {
+		for _, bi := range bIntervals {
+			start := maxInt(ai[0], bi[0])
+			end := minInt(ai[1], bi[1])
+			if start < end {
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
+}
+
 // nextScheduleStart returns the next start time (IST) for a daily schedule relative to nowIST.
 func nextScheduleStart(startTimeIST string, nowIST time.Time) (time.Time, error) {
 	startHour, startMin, err := parseTimeIST(startTimeIST)
@@ -928,6 +980,24 @@ func setSchedule(startTimeIST, endTimeIST string, domains []string, usePF bool, 
 	}
 
 	existingSchedules, _ := loadSchedules()
+
+	// Reject any overlap with existing active schedules
+	for _, existing := range existingSchedules {
+		if !existing.IsActive {
+			continue
+		}
+		overlaps, err := schedulesOverlap(existing.StartTimeIST, existing.EndTimeIST, startTimeIST, endTimeIST)
+		if err != nil {
+			fmt.Printf("Failed to evaluate overlap with schedule %s: %v\n", existing.ID, err)
+			os.Exit(1)
+		}
+		if overlaps {
+			fmt.Printf("Error: New schedule %s-%s IST overlaps with existing schedule %s (%s-%s IST). Overlapping schedules are not allowed.\n",
+				startTimeIST, endTimeIST, existing.ID, existing.StartTimeIST, existing.EndTimeIST)
+			os.Exit(1)
+		}
+	}
+
 	existingSchedules = append(existingSchedules, schedule)
 
 	if err := saveSchedules(existingSchedules); err != nil {
@@ -1860,6 +1930,20 @@ func uniqueDomains(domains []string) []string {
 		out = append(out, d)
 	}
 	return out
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func isValidDomain(d string) bool {
