@@ -165,13 +165,46 @@ func main() {
 	case "block":
 		cmdBlock.Parse(os.Args[2:])
 		domains := cmdBlock.Args()
-
-		// Check if schedule is active - if so, deny manual block
 		if sched, err := loadSchedule(); err == nil && sched.IsActive {
-			fmt.Println("⛔ ACCESS DENIED. A schedule is active.")
-			fmt.Println("   You cannot manually block/unblock while a schedule is in effect.")
-			fmt.Println("   Use 'sudo ./blocker schedule-status' to view schedule details.")
-			os.Exit(1)
+			isWithin, _, timeErr := isWithinSchedule(sched.StartTimeIST, sched.EndTimeIST)
+			if timeErr != nil {
+				fmt.Println("⛔ ACCESS DENIED. Failed to interpret active schedule.")
+				fmt.Println("   Use 'sudo ./blocker schedule-status' to inspect or recreate the schedule.")
+				os.Exit(1)
+			}
+
+			if isWithin {
+				fmt.Println("⛔ ACCESS DENIED. A scheduled block is currently active.")
+				fmt.Printf("   Schedule: %s - %s IST (daily)\n", sched.StartTimeIST, sched.EndTimeIST)
+				fmt.Println("   Manual blocks are only allowed outside the scheduled block window.")
+				fmt.Println("   Use 'sudo ./blocker schedule-status' to view schedule details.")
+				os.Exit(1)
+			}
+
+			nowIST := getCurrentTimeIST()
+			startHour, startMin, parseErr := parseTimeIST(sched.StartTimeIST)
+			if parseErr != nil {
+				fmt.Println("⛔ ACCESS DENIED. Failed to interpret active schedule start time.")
+				fmt.Println("   Use 'sudo ./blocker schedule-status' to inspect or recreate the schedule.")
+				os.Exit(1)
+			}
+			nextBlock := time.Date(nowIST.Year(), nowIST.Month(), nowIST.Day(),
+				startHour, startMin, 0, 0, getISTLocation())
+			if nextBlock.Before(nowIST) {
+				nextBlock = nextBlock.Add(24 * time.Hour)
+			}
+
+			manualEndIST := time.Now().Add(*blockDuration).In(getISTLocation())
+			if !manualEndIST.Before(nextBlock) {
+				fmt.Println("⛔ ACCESS DENIED. This manual block would overlap the next scheduled block.")
+				fmt.Printf("   Schedule: %s - %s IST (daily)\n", sched.StartTimeIST, sched.EndTimeIST)
+				maxDur := time.Until(nextBlock)
+				if maxDur > 0 {
+					fmt.Printf("   You can block manually for up to %v from now without overlapping the schedule.\n", maxDur.Round(time.Minute))
+				}
+				fmt.Println("   Use 'sudo ./blocker schedule-status' to view schedule details.")
+				os.Exit(1)
+			}
 		}
 
 		// Load domains from specified file or default ~/websites.txt
@@ -500,8 +533,14 @@ func runDaemon() {
 				// Just clean up the block state - the schedule will restart it when needed
 				if s.FromSchedule {
 					cleanupScheduledBlock(s)
+					return
 				} else {
-					cleanupAndExit(s)
+					if schedErr == nil && schedule.IsActive {
+						cleanupScheduledBlock(s)
+						return
+					} else {
+						cleanupAndExit(s)
+					}
 				}
 			}
 
