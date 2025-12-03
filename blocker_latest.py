@@ -1,4 +1,9 @@
 '''
+THIS SCRIPT IS DEPRECATED AND ONLY blocker.go IS USED FOR BLOCKING PURPOSE
+'''
+
+
+'''
 This script is used to block websites from being accessed.
 
 This is particularly for macos. So we would use /etc/hosts with immutable flag. The packet filter for dropping network outgoing to the blocked websites.
