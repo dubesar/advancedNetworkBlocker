@@ -1,2 +1,0 @@
-python-daemon>=2.3.0
-lockfile>=0.12.2
