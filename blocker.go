@@ -17,6 +17,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -32,6 +34,8 @@ const (
 	StateDir             = "/var/lib/goblocker" // Persists across reboots (unlike /var/run)
 	StateFile            = StateDir + "/state.json"
 	StateSigFile         = StateFile + ".sig"
+	ScheduleFile         = StateDir + "/schedules.json"
+	ScheduleSigFile      = ScheduleFile + ".sig"
 	KeyFile              = StateDir + "/key"
 	CheckInterval        = 2 * time.Second
 	StateLockFile        = StateFile + ".lock"
@@ -89,6 +93,23 @@ type State struct {
 	HostsWasImmutable bool     `json:"hosts_was_immutable"`
 }
 
+type Schedule struct {
+	ID            string   `json:"id"`
+	Enabled       bool     `json:"enabled"`
+	Hour          int      `json:"hour"`   // 0-23, local time
+	Minute        int      `json:"minute"` // 0-59, local time
+	DurationSec   int64    `json:"duration_sec"`
+	Domains       []string `json:"domains"`
+	UsePF         bool     `json:"use_pf"`
+	LastFiredDate string   `json:"last_fired_date"` // YYYY-MM-DD in local time
+	CreatedUnix   int64    `json:"created_unix"`
+}
+
+type ScheduleStore struct {
+	Version   int        `json:"version"`
+	Schedules []Schedule `json:"schedules"`
+}
+
 func main() {
 	// CLI Flags
 	cmdBlock := flag.NewFlagSet("block", flag.ExitOnError)
@@ -102,12 +123,13 @@ func main() {
 	cmdStatus := flag.NewFlagSet("status", flag.ExitOnError)
 
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: sudo ./blocker <block|unblock|status> [args]")
+		fmt.Println("Usage: sudo ./blocker <block|unblock|status|schedule> [args]")
 		fmt.Println("")
 		fmt.Println("Commands:")
 		fmt.Println("  block    Block specified domains for a duration")
 		fmt.Println("  unblock  Attempt to unblock (only works after duration expires)")
 		fmt.Println("  status   Show current block status")
+		fmt.Println("  schedule Manage daily schedules that trigger blocks")
 		fmt.Println("")
 		fmt.Println("Block Options:")
 		fmt.Println("  -duration  Duration to block (e.g., 1h, 30m, 2h30m)")
@@ -118,6 +140,8 @@ func main() {
 		fmt.Println("  sudo ./blocker block -duration 1h facebook.com twitter.com")
 		fmt.Println("  sudo ./blocker block -duration 2h -file ~/websites.txt")
 		fmt.Println("  sudo ./blocker status")
+		fmt.Println("  sudo ./blocker schedule add -at 09:00 -duration 1h -file ~/websites.txt")
+		fmt.Println("  sudo ./blocker schedule list")
 		os.Exit(1)
 	}
 
@@ -176,6 +200,9 @@ func main() {
 		cmdStatus.Parse(os.Args[2:])
 		showStatus()
 
+	case "schedule":
+		handleSchedule(os.Args[2:])
+
 	default:
 		fmt.Println("Unknown command")
 	}
@@ -226,14 +253,19 @@ func killExistingDaemons() {
 // --- High Level Commands ---
 
 func startBlock(domains []string, duration time.Duration, usePF bool) {
-	if err := ensureDir(StateDir); err != nil {
-		fmt.Printf("Failed to create state directory (%s): %v\n", StateDir, err)
+	if err := startBlockInternal(domains, duration, usePF, true); err != nil {
+		fmt.Println(err.Error())
 		os.Exit(1)
+	}
+}
+
+func startBlockInternal(domains []string, duration time.Duration, usePF bool, manageDaemon bool) error {
+	if err := ensureDir(StateDir); err != nil {
+		return fmt.Errorf("failed to create state directory (%s): %w", StateDir, err)
 	}
 	lf, err := lockFile(StateLockFile)
 	if err != nil {
-		fmt.Printf("Failed to acquire state lock: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to acquire state lock: %w", err)
 	}
 	defer unlockFile(lf)
 
@@ -243,18 +275,18 @@ func startBlock(domains []string, duration time.Duration, usePF bool) {
 		now := time.Now().Unix()
 		if now < existingState.EndUnix {
 			remaining := time.Until(time.Unix(existingState.EndUnix, 0)).Round(time.Second)
-			fmt.Printf("⛔ A block is already active! Remaining: %v\n", remaining)
-			os.Exit(1)
+			return fmt.Errorf("⛔ A block is already active! Remaining: %v", remaining)
 		}
 	}
 
-	killExistingDaemons()
+	if manageDaemon {
+		killExistingDaemons()
+	}
 
 	// Validate domains
 	for _, d := range domains {
 		if !isValidDomain(d) {
-			fmt.Printf("Invalid domain: %s\n", d)
-			os.Exit(1)
+			return fmt.Errorf("invalid domain: %s", d)
 		}
 	}
 
@@ -266,8 +298,7 @@ func startBlock(domains []string, duration time.Duration, usePF bool) {
 
 	// Ensure key exists
 	if err := ensureKey(); err != nil {
-		fmt.Printf("Failed to ensure key: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to ensure key: %w", err)
 	}
 
 	// 1. Save State
@@ -284,36 +315,38 @@ func startBlock(domains []string, duration time.Duration, usePF bool) {
 		HostsWasImmutable: hostsWasImmutable,
 	}
 	if err := saveState(s); err != nil {
-		fmt.Printf("Failed to save state: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to save state: %w", err)
 	}
 
 	// 2. Apply block
 	if usePF {
 		if err := applyPFBlock(domains); err != nil {
-			fmt.Printf("Failed to apply PF block: %v\n", err)
+			// rollback state
 			// rollback state
 			_ = removeStateFiles()
-			os.Exit(1)
+			return fmt.Errorf("failed to apply PF block: %w", err)
 		}
 	} else {
 		if err := applyHostsBlock(domains); err != nil {
-			fmt.Printf("Failed to apply hosts block: %v\n", err)
+			// rollback state
 			_ = removeStateFiles()
-			os.Exit(1)
+			return fmt.Errorf("failed to apply hosts block: %w", err)
 		}
 	}
 
 	// 3. Install and Load Daemon (Watchdog)
-	exePath, _ := filepath.Abs(os.Args[0])
-	if err := installPlist(exePath); err != nil {
-		fmt.Printf("Failed to install plist: %v\n", err)
-		// not fatal; continue but warn
+	if manageDaemon {
+		exePath, _ := filepath.Abs(os.Args[0])
+		if err := installPlist(exePath); err != nil {
+			// not fatal; continue but warn
+			fmt.Printf("Failed to install plist: %v\n", err)
+		}
 	}
 
 	fmt.Printf("🔒 LOCKED. Blocked %d base domains (%d total with subdomains) until %s.\n",
 		len(domains), len(domains)*len(commonSubdomains)+len(domains), end.Format(time.Kitchen))
 	fmt.Println("⚠️  Emergency unblock is DISABLED by default. Use an emergency procedure if needed.")
+	return nil
 }
 
 func runDaemon() {
@@ -338,6 +371,7 @@ func runDaemon() {
 	// 2. Watchdog Loop
 	ticker := time.NewTicker(CheckInterval)
 	lastCheck := time.Now().Unix()
+	lastScheduleAttempt := int64(0)
 	consecutiveErrors := 0
 	consecutiveIntegrityFailures := 0
 	maxConsecutiveErrors := 30
@@ -351,11 +385,33 @@ func runDaemon() {
 				}
 			}()
 
-			s, err := loadState()
-			if err != nil {
-				// If state unavailable or signature invalid, do NOT cleanup. Alert and continue.
+			now := time.Now()
+			nowUnix := now.Unix()
+
+			// Detect clock tamper: if system time is earlier than last check by >1 minute, refuse schedule actions.
+			if nowUnix < lastCheck-60 {
+				log.Printf("[daemon] system clock appears to have been set backwards (last %d, now %d). Refusing schedule actions.\n", lastCheck, nowUnix)
+				lastCheck = nowUnix
+				return
+			}
+
+			schedules, _, schErr := loadSchedulesOptional()
+			if schErr != nil {
 				consecutiveErrors++
-				log.Printf("[daemon] loadState error: %v (count: %d)\n", err, consecutiveErrors)
+				log.Printf("[daemon] loadSchedules error: %v (count: %d)\n", schErr, consecutiveErrors)
+				if consecutiveErrors >= maxConsecutiveErrors {
+					log.Printf("[daemon] Exiting due to persistent schedule errors\n")
+					os.Exit(0)
+				}
+				return
+			}
+
+			// If there is no active block state, we may still be running to service schedules.
+			s, hasState, stateErr := loadStateOptional()
+			if stateErr != nil {
+				// If state exists but is unreadable/signature invalid, do NOT cleanup. Alert and continue.
+				consecutiveErrors++
+				log.Printf("[daemon] loadState error: %v (count: %d)\n", stateErr, consecutiveErrors)
 				if consecutiveErrors >= maxConsecutiveErrors {
 					log.Printf("[daemon] Exiting due to persistent state errors\n")
 					os.Exit(0)
@@ -363,25 +419,110 @@ func runDaemon() {
 				return
 			}
 
-			// Detect clock tamper: if system time is earlier than saved start by >1 minute -> tamper
-			now := time.Now().Unix()
-			if now < s.StartUnix-60 {
-				log.Printf("[daemon] system clock appears to have been set backwards (saved %d, now %d). Refusing to cleanup.\n", s.StartUnix, now)
+			needsDaemon := anyEnabledSchedule(schedules)
+
+			// If nothing to do, exit cleanly. Launchd KeepAlive is configured to not relaunch on success.
+			if !hasState && !needsDaemon {
+				log.Printf("[daemon] idle (no active block, no enabled schedules). Exiting.\n")
+				os.Exit(0)
+			}
+
+			// If no active block, check if a schedule is due and start it.
+			if !hasState || !s.IsActive {
+				dueIdx, mode, domains, dur := dueSchedules(now, schedules)
+				if len(dueIdx) == 0 {
+					lastCheck = nowUnix
+					consecutiveErrors = 0
+					return
+				}
+
+				// Throttle attempts to avoid spam if enforcement is impossible.
+				if lastScheduleAttempt != 0 && nowUnix-lastScheduleAttempt < 60 {
+					return
+				}
+				lastScheduleAttempt = nowUnix
+
+				if err := startBlockInternal(domains, dur, mode, false); err != nil {
+					log.Printf("[daemon] scheduled start failed: %v\n", err)
+					return
+				}
+
+				// Mark schedules as fired for today.
+				markSchedulesFired(now, &schedules, dueIdx)
+				if err := saveSchedules(schedules); err != nil {
+					log.Printf("[daemon] failed to save schedules after firing: %v\n", err)
+				}
+
+				log.Printf("[daemon] scheduled block started (%d domains, duration %v)\n", len(domains), dur)
+				lastCheck = nowUnix
+				consecutiveErrors = 0
 				return
 			}
 
-			delta := now - lastCheck
+			// Active block path
+			// Detect clock tamper: if system time is earlier than saved start by >1 minute -> tamper
+			if nowUnix < s.StartUnix-60 {
+				log.Printf("[daemon] system clock appears to have been set backwards (saved %d, now %d). Refusing to cleanup.\n", s.StartUnix, nowUnix)
+				return
+			}
+
+			delta := nowUnix - lastCheck
 			if delta > int64(ForwardJumpThreshold.Seconds()) {
-				log.Printf("[daemon] detected long inactivity or clock jump (last %d, now %d, delta %d). Treating as inactive time; extending block.\n", lastCheck, now, delta)
+				log.Printf("[daemon] detected long inactivity or clock jump (last %d, now %d, delta %d). Treating as inactive time; extending block.\n", lastCheck, nowUnix, delta)
 				s.EndUnix += delta
+				s.DurationSec = s.EndUnix - s.StartUnix
 				if err := saveState(s); err != nil {
 					log.Printf("[daemon] failed to save adjusted state: %v\n", err)
 				}
 			}
 
+			// If schedules are due during an active block, merge domains and extend end time where possible.
+			dueIdx, dueDomains, dueDur := dueSchedulesWithMode(now, schedules, s.UsePF)
+			if len(dueIdx) > 0 {
+				merged := uniqueDomains(append(append([]string{}, s.Domains...), dueDomains...))
+				updated := false
+				if len(merged) != len(s.Domains) {
+					s.Domains = merged
+					updated = true
+				}
+				candidateEnd := now.Add(dueDur).Unix()
+				if candidateEnd > s.EndUnix {
+					s.EndUnix = candidateEnd
+					s.DurationSec = s.EndUnix - s.StartUnix
+					updated = true
+				}
+				if updated {
+					if err := saveState(s); err != nil {
+						log.Printf("[daemon] failed to save merged state: %v\n", err)
+					} else {
+						// Re-apply to ensure the new domain set is enforced.
+						if s.UsePF {
+							_ = applyPFBlock(s.Domains)
+						} else {
+							_ = applyHostsBlock(s.Domains)
+						}
+					}
+				}
+
+				markSchedulesFired(now, &schedules, dueIdx)
+				if err := saveSchedules(schedules); err != nil {
+					log.Printf("[daemon] failed to save schedules after merge: %v\n", err)
+				}
+			}
+
 			// Check for expiry
-			if now >= s.EndUnix {
-				cleanupAndExit(s)
+			if nowUnix >= s.EndUnix {
+				if err := cleanupBlock(s); err != nil {
+					log.Printf("[daemon] cleanup failed: %v\n", err)
+				}
+				// If schedules are enabled, keep running; otherwise exit cleanly.
+				schedules2, _, _ := loadSchedulesOptional()
+				if !anyEnabledSchedule(schedules2) {
+					os.Exit(0)
+				}
+				lastCheck = nowUnix
+				consecutiveErrors = 0
+				return
 			}
 
 			// Self-Healing: Verify integrity based on enforcement mode
@@ -409,7 +550,7 @@ func runDaemon() {
 			}
 
 			// Reset counters on success
-			lastCheck = now
+			lastCheck = nowUnix
 			consecutiveErrors = 0
 			consecutiveIntegrityFailures = 0
 		}()
@@ -418,12 +559,16 @@ func runDaemon() {
 
 func attemptUnblock() {
 	// Strict check logic
-	s, err := loadState()
+	s, hasState, err := loadStateOptional()
 	if err != nil {
 		fmt.Println("⛔ ACCESS DENIED. Unable to verify active block state.")
 		fmt.Printf("   Details: %v\n", err)
 		fmt.Println("   Manual emergency recovery is required; automatic unblock is disabled.")
 		os.Exit(1)
+	}
+	if !hasState || !s.IsActive {
+		fmt.Println("No active block.")
+		return
 	}
 
 	remaining := time.Until(time.Unix(s.EndUnix, 0))
@@ -438,7 +583,12 @@ func attemptUnblock() {
 
 	// Time is up
 	fmt.Println("✅ Time is up. Unblocking...")
-	cleanupAndExit(s)
+	if err := cleanupBlock(s); err != nil {
+		fmt.Printf("Cleanup failed: %v\n", err)
+		os.Exit(1)
+	}
+	maybeUninstallDaemonIfIdle()
+	fmt.Println("System restored.")
 }
 
 func showStatus() {
@@ -494,6 +644,456 @@ func showStatus() {
 	fmt.Printf("   Total entries: %d (with subdomains)\n", len(s.Domains)*(len(commonSubdomains)+1))
 	fmt.Printf("   Ends at: %s\n", end.Format(time.Kitchen))
 	fmt.Printf("⏳ Time remaining: %v\n", remaining.Round(time.Second))
+}
+
+func handleSchedule(args []string) {
+	if len(args) < 1 {
+		printScheduleUsage()
+		os.Exit(1)
+	}
+
+	sub := args[0]
+	switch sub {
+	case "add":
+		cmd := flag.NewFlagSet("schedule add", flag.ExitOnError)
+		at := cmd.String("at", "", "Start time (HH:MM, 24-hour local time)")
+		dur := cmd.Duration("duration", 0, "Duration to block (e.g., 1h, 30m)")
+		usePF := cmd.Bool("pf", false, "Use PF firewall rules instead of /etc/hosts")
+		websitesFile := cmd.String("file", "", "Path to file containing domains to block (default: ~/websites.txt if present)")
+		cmd.Parse(args[1:])
+
+		h, m, err := parseHHMM(*at)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+		if *dur <= 0 {
+			fmt.Println("Error: Must provide a valid -duration (e.g., 45m, 1h).")
+			os.Exit(1)
+		}
+		if *dur > MaxBlockDuration {
+			fmt.Printf("Error: Duration exceeds maximum allowed (%v).\n", MaxBlockDuration)
+			os.Exit(1)
+		}
+
+		domains := cmd.Args()
+
+		var filePath string
+		if *websitesFile != "" {
+			filePath = expandTilde(*websitesFile)
+		}
+		fileDomains, loadedPath, err := loadDomainsFromFileWithPath(filePath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				if *websitesFile != "" {
+					fmt.Printf("Error: Specified file not found: %s\n", filePath)
+					os.Exit(1)
+				}
+			} else {
+				fmt.Printf("Warning: failed to read %s: %v\n", loadedPath, err)
+			}
+		} else if len(fileDomains) > 0 {
+			fmt.Printf("📄 Loaded %d domains from %s\n", len(fileDomains), loadedPath)
+			domains = append(domains, fileDomains...)
+		}
+
+		domains = uniqueDomains(domains)
+		if len(domains) == 0 {
+			fmt.Println("Error: Must provide domains (inline or via -file).")
+			os.Exit(1)
+		}
+		for _, d := range domains {
+			if !isValidDomain(d) {
+				fmt.Printf("Invalid domain: %s\n", d)
+				os.Exit(1)
+			}
+		}
+
+		if err := ensureDir(StateDir); err != nil {
+			fmt.Printf("Failed to create state directory (%s): %v\n", StateDir, err)
+			os.Exit(1)
+		}
+		lf, err := lockFile(StateLockFile)
+		if err != nil {
+			fmt.Printf("Failed to acquire state lock: %v\n", err)
+			os.Exit(1)
+		}
+		defer unlockFile(lf)
+
+		st, _, err := loadSchedulesOptional()
+		if err != nil {
+			fmt.Printf("Failed to load schedules: %v\n", err)
+			os.Exit(1)
+		}
+		if st.Version == 0 {
+			st.Version = 1
+		}
+		for _, existing := range st.Schedules {
+			if existing.UsePF != *usePF {
+				fmt.Println("Error: Mixing PF and /etc/hosts schedules is not supported. Remove existing schedules first.")
+				os.Exit(1)
+			}
+		}
+
+		id := randomHexID(8)
+		st.Schedules = append(st.Schedules, Schedule{
+			ID:          id,
+			Enabled:     true,
+			Hour:        h,
+			Minute:      m,
+			DurationSec: int64(dur.Seconds()),
+			Domains:     domains,
+			UsePF:       *usePF,
+			CreatedUnix: time.Now().Unix(),
+		})
+
+		if err := saveSchedules(st); err != nil {
+			fmt.Printf("Failed to save schedules: %v\n", err)
+			os.Exit(1)
+		}
+
+		ensureDaemonRunning()
+		fmt.Printf("✅ Schedule added: id=%s, daily at %s for %v (%d domains)\n", id, formatHHMM(h, m), *dur, len(domains))
+
+	case "list":
+		if err := ensureKey(); err != nil {
+			// Best-effort: listing may be useful even if keychain is in a weird state, but signed files need the key.
+			fmt.Printf("Warning: failed to ensure signing key: %v\n", err)
+		}
+		st, present, err := loadSchedulesOptional()
+		if err != nil {
+			fmt.Printf("Failed to load schedules: %v\n", err)
+			os.Exit(1)
+		}
+		if !present || len(st.Schedules) == 0 {
+			fmt.Println("No schedules configured.")
+			return
+		}
+		fmt.Printf("Schedules (%d):\n", len(st.Schedules))
+		for _, sch := range st.Schedules {
+			mode := "/etc/hosts"
+			if sch.UsePF {
+				mode = "PF"
+			}
+			enabled := "disabled"
+			if sch.Enabled {
+				enabled = "enabled"
+			}
+			fmt.Printf("  - id=%s (%s) at %s for %v (%s, %d domains)\n",
+				sch.ID, enabled, formatHHMM(sch.Hour, sch.Minute), time.Duration(sch.DurationSec)*time.Second, mode, len(sch.Domains))
+		}
+
+	case "remove":
+		cmd := flag.NewFlagSet("schedule remove", flag.ExitOnError)
+		id := cmd.String("id", "", "Schedule id to remove")
+		cmd.Parse(args[1:])
+		if *id == "" {
+			fmt.Println("Error: -id is required.")
+			os.Exit(1)
+		}
+
+		if err := ensureDir(StateDir); err != nil {
+			fmt.Printf("Failed to create state directory (%s): %v\n", StateDir, err)
+			os.Exit(1)
+		}
+		lf, err := lockFile(StateLockFile)
+		if err != nil {
+			fmt.Printf("Failed to acquire state lock: %v\n", err)
+			os.Exit(1)
+		}
+		defer unlockFile(lf)
+
+		st, present, err := loadSchedulesOptional()
+		if err != nil {
+			fmt.Printf("Failed to load schedules: %v\n", err)
+			os.Exit(1)
+		}
+		if !present || len(st.Schedules) == 0 {
+			fmt.Println("No schedules configured.")
+			return
+		}
+		var out []Schedule
+		found := false
+		for _, sch := range st.Schedules {
+			if sch.ID == *id {
+				found = true
+				continue
+			}
+			out = append(out, sch)
+		}
+		if !found {
+			fmt.Printf("Error: schedule id not found: %s\n", *id)
+			os.Exit(1)
+		}
+		st.Schedules = out
+		if len(st.Schedules) == 0 {
+			_ = removeScheduleFiles()
+		} else {
+			if err := saveSchedules(st); err != nil {
+				fmt.Printf("Failed to save schedules: %v\n", err)
+				os.Exit(1)
+			}
+		}
+		maybeUninstallDaemonIfIdle()
+		fmt.Println("✅ Schedule removed.")
+
+	case "enable", "disable":
+		cmd := flag.NewFlagSet("schedule "+sub, flag.ExitOnError)
+		id := cmd.String("id", "", "Schedule id to modify")
+		cmd.Parse(args[1:])
+		if *id == "" {
+			fmt.Println("Error: -id is required.")
+			os.Exit(1)
+		}
+
+		if err := ensureDir(StateDir); err != nil {
+			fmt.Printf("Failed to create state directory (%s): %v\n", StateDir, err)
+			os.Exit(1)
+		}
+		lf, err := lockFile(StateLockFile)
+		if err != nil {
+			fmt.Printf("Failed to acquire state lock: %v\n", err)
+			os.Exit(1)
+		}
+		defer unlockFile(lf)
+
+		st, present, err := loadSchedulesOptional()
+		if err != nil {
+			fmt.Printf("Failed to load schedules: %v\n", err)
+			os.Exit(1)
+		}
+		if !present || len(st.Schedules) == 0 {
+			fmt.Println("No schedules configured.")
+			return
+		}
+		changed := false
+		for i := range st.Schedules {
+			if st.Schedules[i].ID == *id {
+				st.Schedules[i].Enabled = (sub == "enable")
+				changed = true
+				break
+			}
+		}
+		if !changed {
+			fmt.Printf("Error: schedule id not found: %s\n", *id)
+			os.Exit(1)
+		}
+		if err := saveSchedules(st); err != nil {
+			fmt.Printf("Failed to save schedules: %v\n", err)
+			os.Exit(1)
+		}
+		if sub == "enable" {
+			ensureDaemonRunning()
+		} else {
+			maybeUninstallDaemonIfIdle()
+		}
+		fmt.Println("✅ Schedule updated.")
+
+	case "clear":
+		if err := ensureDir(StateDir); err != nil {
+			fmt.Printf("Failed to create state directory (%s): %v\n", StateDir, err)
+			os.Exit(1)
+		}
+		lf, err := lockFile(StateLockFile)
+		if err != nil {
+			fmt.Printf("Failed to acquire state lock: %v\n", err)
+			os.Exit(1)
+		}
+		defer unlockFile(lf)
+		_ = removeScheduleFiles()
+		maybeUninstallDaemonIfIdle()
+		fmt.Println("✅ All schedules cleared.")
+
+	default:
+		printScheduleUsage()
+		os.Exit(1)
+	}
+}
+
+func printScheduleUsage() {
+	fmt.Println("Usage:")
+	fmt.Println("  sudo ./blocker schedule add -at HH:MM -duration 1h [-pf] [-file ~/websites.txt] [domains...]")
+	fmt.Println("  sudo ./blocker schedule list")
+	fmt.Println("  sudo ./blocker schedule remove -id <id>")
+	fmt.Println("  sudo ./blocker schedule enable -id <id>")
+	fmt.Println("  sudo ./blocker schedule disable -id <id>")
+	fmt.Println("  sudo ./blocker schedule clear")
+}
+
+func parseHHMM(s string) (int, int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, 0, fmt.Errorf("missing -at (expected HH:MM)")
+	}
+	parts := strings.Split(s, ":")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid -at %q (expected HH:MM)", s)
+	}
+	h, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid hour in -at %q", s)
+	}
+	m, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid minute in -at %q", s)
+	}
+	if h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, 0, fmt.Errorf("invalid -at %q (hour 0-23, minute 0-59)", s)
+	}
+	return h, m, nil
+}
+
+func formatHHMM(h, m int) string {
+	return fmt.Sprintf("%02d:%02d", h, m)
+}
+
+func randomHexID(nbytes int) string {
+	if nbytes <= 0 {
+		nbytes = 8
+	}
+	b := make([]byte, nbytes)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func anyEnabledSchedule(st ScheduleStore) bool {
+	for _, sch := range st.Schedules {
+		if sch.Enabled {
+			return true
+		}
+	}
+	return false
+}
+
+// dueSchedules finds schedules due at/after their daily time. It returns a set of schedule indices to fire,
+// constrained to the enforcement mode (PF vs hosts) of the earliest due schedule.
+func dueSchedules(now time.Time, st ScheduleStore) ([]int, bool, []string, time.Duration) {
+	type cand struct {
+		idx   int
+		start time.Time
+	}
+	today := now.In(time.Local).Format("2006-01-02")
+	var cands []cand
+	for i, sch := range st.Schedules {
+		if !sch.Enabled {
+			continue
+		}
+		if sch.LastFiredDate == today {
+			continue
+		}
+		if sch.DurationSec <= 0 {
+			continue
+		}
+		if time.Duration(sch.DurationSec)*time.Second > MaxBlockDuration {
+			continue
+		}
+		if sch.Hour < 0 || sch.Hour > 23 || sch.Minute < 0 || sch.Minute > 59 {
+			continue
+		}
+		start := time.Date(now.Year(), now.Month(), now.Day(), sch.Hour, sch.Minute, 0, 0, now.Location())
+		if now.Before(start) {
+			continue
+		}
+		cands = append(cands, cand{idx: i, start: start})
+	}
+	if len(cands) == 0 {
+		return nil, false, nil, 0
+	}
+	sort.Slice(cands, func(i, j int) bool { return cands[i].start.Before(cands[j].start) })
+
+	mode := st.Schedules[cands[0].idx].UsePF
+	var idxs []int
+	var domains []string
+	var maxDur time.Duration
+	for _, c := range cands {
+		sch := st.Schedules[c.idx]
+		if sch.UsePF != mode {
+			continue
+		}
+		idxs = append(idxs, c.idx)
+		domains = append(domains, sch.Domains...)
+		d := time.Duration(sch.DurationSec) * time.Second
+		if d > maxDur {
+			maxDur = d
+		}
+	}
+	domains = uniqueDomains(domains)
+	return idxs, mode, domains, maxDur
+}
+
+func dueSchedulesWithMode(now time.Time, st ScheduleStore, mode bool) ([]int, []string, time.Duration) {
+	type cand struct {
+		idx   int
+		start time.Time
+	}
+	today := now.In(time.Local).Format("2006-01-02")
+	var cands []cand
+	for i, sch := range st.Schedules {
+		if !sch.Enabled || sch.UsePF != mode {
+			continue
+		}
+		if sch.LastFiredDate == today {
+			continue
+		}
+		if sch.DurationSec <= 0 {
+			continue
+		}
+		if time.Duration(sch.DurationSec)*time.Second > MaxBlockDuration {
+			continue
+		}
+		start := time.Date(now.Year(), now.Month(), now.Day(), sch.Hour, sch.Minute, 0, 0, now.Location())
+		if now.Before(start) {
+			continue
+		}
+		cands = append(cands, cand{idx: i, start: start})
+	}
+	if len(cands) == 0 {
+		return nil, nil, 0
+	}
+	sort.Slice(cands, func(i, j int) bool { return cands[i].start.Before(cands[j].start) })
+
+	var idxs []int
+	var domains []string
+	var maxDur time.Duration
+	for _, c := range cands {
+		sch := st.Schedules[c.idx]
+		idxs = append(idxs, c.idx)
+		domains = append(domains, sch.Domains...)
+		d := time.Duration(sch.DurationSec) * time.Second
+		if d > maxDur {
+			maxDur = d
+		}
+	}
+	domains = uniqueDomains(domains)
+	return idxs, domains, maxDur
+}
+
+func markSchedulesFired(now time.Time, st *ScheduleStore, idxs []int) {
+	today := now.In(time.Local).Format("2006-01-02")
+	for _, idx := range idxs {
+		if idx < 0 || idx >= len(st.Schedules) {
+			continue
+		}
+		st.Schedules[idx].LastFiredDate = today
+	}
+}
+
+func daemonIsLoaded() bool {
+	// "launchctl list <label>" exits 0 if the job is loaded, non-zero otherwise.
+	return exec.Command(launchctlPath, "list", PlistLabel).Run() == nil
+}
+
+func ensureDaemonRunning() {
+	if daemonIsLoaded() {
+		// Best-effort: if the job is loaded but not currently running (e.g., exited 0),
+		// ask launchd to start it now.
+		_ = exec.Command(launchctlPath, "start", PlistLabel).Run()
+		return
+	}
+	exePath, _ := filepath.Abs(os.Args[0])
+	if err := installPlist(exePath); err != nil {
+		fmt.Printf("Warning: failed to install daemon: %v\n", err)
+	}
 }
 
 // --- Core Logic ---
@@ -617,17 +1217,16 @@ func flushDNSCache() {
 	_ = exec.Command(discoveryutilPath, "udnsflushcaches").Run()
 }
 
-func cleanupAndExit(s State) {
+func cleanupBlock(s State) error {
 	if s.UsePF {
 		_ = cleanupPF(s.PFWasEnabled)
 	}
 
-	// Hosts cleanup
 	hostsWasImmutable := s.HostsWasImmutable
 
+	// Best-effort cleanup of /etc/hosts marker block.
 	if err := setImmutable(false); err != nil {
-		fmt.Printf("[cleanupAndExit] failed to unset immutable: %v\n", err)
-		// non-fatal: log but continue cleanup
+		// continue cleanup even if we can't toggle flags
 	}
 
 	hPath := hostsPath()
@@ -641,19 +1240,32 @@ func cleanupAndExit(s State) {
 	_ = atomicWrite(hPath, []byte(clean), 0644)
 
 	if hostsWasImmutable {
-		if err := setImmutable(true); err != nil {
-			fmt.Printf("[cleanupAndExit] failed to restore immutable flag: %v\n", err)
-		}
+		_ = setImmutable(true)
 	}
 
-	// Flush DNS cache
 	flushDNSCache()
+	_ = removeStateFiles()
+	return nil
+}
 
-	// Remove Persistence
+func maybeUninstallDaemonIfIdle() {
+	// If a state file exists, assume an active (or recoverable) block and keep the daemon.
+	if _, err := os.Stat(StateFile); err == nil {
+		return
+	}
+
+	st, _, err := loadSchedulesOptional()
+	if err == nil && anyEnabledSchedule(st) {
+		return
+	}
+
 	_ = exec.Command(launchctlPath, "unload", "-w", PlistPath).Run()
 	_ = os.Remove(PlistPath)
-	_ = removeStateFiles()
+}
 
+func cleanupAndExit(s State) {
+	_ = cleanupBlock(s)
+	maybeUninstallDaemonIfIdle()
 	fmt.Println("System restored.")
 	os.Exit(0)
 }
@@ -850,6 +1462,89 @@ func loadState() (State, error) {
 		return s, fmt.Errorf("unmarshal state: %w", err)
 	}
 	return s, nil
+}
+
+func loadStateOptional() (State, bool, error) {
+	var s State
+	if _, err := os.Stat(StateFile); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return s, false, nil
+		}
+		return s, false, fmt.Errorf("state file stat: %w", err)
+	}
+	if _, err := os.Stat(StateSigFile); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return s, true, fmt.Errorf("state sig missing: %w", err)
+		}
+		return s, true, fmt.Errorf("state sig stat: %w", err)
+	}
+	loaded, err := loadState()
+	if err != nil {
+		return s, true, err
+	}
+	return loaded, true, nil
+}
+
+func saveSchedules(st ScheduleStore) error {
+	if st.Version == 0 {
+		st.Version = 1
+	}
+	b, err := json.Marshal(st)
+	if err != nil {
+		return err
+	}
+	if err := ensureDir(StateDir); err != nil {
+		return fmt.Errorf("failed to create state directory: %w", err)
+	}
+	if err := atomicWrite(ScheduleFile, b, 0600); err != nil {
+		return err
+	}
+	if err := ensureKey(); err != nil {
+		return fmt.Errorf("failed to ensure key: %w", err)
+	}
+	sig, err := signData(b)
+	if err != nil {
+		return err
+	}
+	if err := atomicWrite(ScheduleSigFile, []byte(sig), 0600); err != nil {
+		return err
+	}
+	return nil
+}
+
+func loadSchedulesOptional() (ScheduleStore, bool, error) {
+	var st ScheduleStore
+	b, err := os.ReadFile(ScheduleFile)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return st, false, nil
+		}
+		return st, true, fmt.Errorf("schedule file read: %w", err)
+	}
+	sigb, err := os.ReadFile(ScheduleSigFile)
+	if err != nil {
+		return st, true, fmt.Errorf("schedule sig missing: %w", err)
+	}
+	ok, sigErr := verifySig(b, string(sigb))
+	if sigErr != nil {
+		return st, true, fmt.Errorf("verifySig error: %w", sigErr)
+	}
+	if !ok {
+		return st, true, fmt.Errorf("schedule signature invalid")
+	}
+	if err := json.Unmarshal(b, &st); err != nil {
+		return st, true, fmt.Errorf("unmarshal schedules: %w", err)
+	}
+	if st.Version == 0 {
+		st.Version = 1
+	}
+	return st, true, nil
+}
+
+func removeScheduleFiles() error {
+	_ = os.Remove(ScheduleFile)
+	_ = os.Remove(ScheduleSigFile)
+	return nil
 }
 
 func ensureDir(dir string) error {

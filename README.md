@@ -1,35 +1,9 @@
 # advancedNetworkBlocker
 
-A small Python tool to temporarily block distracting websites. It updates `/etc/hosts` and can use optional firewall and DNS rules to keep the blocks in place.
+A small macOS-focused blocker. The current implementation is in `blocker.go` and can enforce blocks via `/etc/hosts` (default) or PF firewall rules.
 
 ## Usage
 
-Run the script as root and specify the number of minutes to keep sites blocked:
-
-```bash
-sudo python3 blocker.py <duration_in_minutes>
-```
-
-Once started, it waits a few seconds before enabling the block list. When the timer ends, all changes are removed automatically. To end the blocker early, you must solve math challenges and supply a password hidden on your system.
-
-## Checking Remaining Time
-
-While the blocker is running, you can check how much time is left in several ways:
-
-### 1. Check the Log File
-```bash
-sudo tail -f /var/log/website_blocker.log
-```
-The log shows remaining time every minute: `XX.X minutes remaining`
-
-### 2. Check Process Status
-```bash
-ps aux | grep blocker.py
-```
-This shows when the process started. Calculate remaining time based on the duration you specified.
-
-
-### Using blocker.go
 1. Build the binary:
 ```bash
 go build -o blocker blocker.go
@@ -42,3 +16,32 @@ sudo ./blocker block -duration 60m twitter.com facebook.com instagram.com
 ```bash
 sudo ./blocker status
 ```
+
+## Schedules (Daily)
+
+You can configure daily schedules that automatically start a block at a specific local time.
+
+Add a schedule:
+```bash
+sudo ./blocker schedule add -at 09:00 -duration 1h -file ~/websites.txt
+```
+
+List schedules:
+```bash
+sudo ./blocker schedule list
+```
+
+Disable/enable a schedule:
+```bash
+sudo ./blocker schedule disable -id <id>
+sudo ./blocker schedule enable -id <id>
+```
+
+Remove a schedule:
+```bash
+sudo ./blocker schedule remove -id <id>
+```
+
+Notes:
+- Schedules are evaluated by a root `launchd` daemon; if your laptop sleeps through a scheduled time, the block starts shortly after wake (once per day per schedule).
+- Logs are written to `/var/log/goblocker.log`.
